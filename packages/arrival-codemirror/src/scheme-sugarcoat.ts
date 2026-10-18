@@ -28,6 +28,16 @@ export const DEFINITION_KEYWORDS = set(`
   syntax-rules syntax-case
 `);
 
+// Heads whose children are not arguments (§5.3 of the reader guideline).
+// A hue only in operator position — the same word as data stays ink.
+export const SPECIAL_HEADS = set(`
+  lambda λ case-lambda opt-lambda
+  let let* letrec letrec* let-values let*-values let/ec let/cc
+  define define-values
+  cond case
+  syntax-rules syntax-case
+`);
+
 export const CONTROL_KEYWORDS = set(`
   if cond when unless case else
   and or not
@@ -57,6 +67,7 @@ export type DelimKind = "dict" | "nexpr" | "list" | "sub" | "ambig" | "err";
 interface SchemeSugarcoatState {
   mode: false | "string" | "comment" | "attext" | "atgraft";
   afterDefineHead: boolean; // next atom after `(define ...` → DEFNAME
+  atHead: boolean; // next symbol is the operator of a list
   atDepth: number; // literal {} depth inside @head{...} (0 closes the body)
   graftDepth: number; // paren depth inside @() graft (0 = just closed)
   /** Code-context brace/bracket stack (not at-body). Close tags match open kind. */
@@ -409,6 +420,7 @@ const CURLY_AMBIG = "sugarcoatCurlyAmbig"; // mid-edit provisional { }
 const CURLY_ERR = "sugarcoatCurlyError"; // broken curly shape
 const ATCLOSE = "sugarcoatAtClose"; // @head{…} body close `}`
 const DEFNAME = "sugarcoatDefName"; // defined name → definition(variableName)
+const SPECIAL = "sugarcoatSpecial"; // known special-form head → keyword
 const ATOPEN = "sugarcoatAtOpen"; // @head{ opener → keyword (the tagged-template head)
 const INTERP = "sugarcoatInterp"; // @id / @(…) / @|…| inside a text body → variableName pop
 
@@ -517,7 +529,7 @@ function tokenizeGraftCode(stream: StringStream, state: SchemeSugarcoatState): s
 
 export const parser: StreamParser<SchemeSugarcoatState> = {
   name: "scheme-sugarcoat",
-  startState: () => ({ mode: false, afterDefineHead: false, atDepth: 0, graftDepth: 0, delimStack: [] }),
+  startState: () => ({ mode: false, afterDefineHead: false, atHead: false, atDepth: 0, graftDepth: 0, delimStack: [] }),
 
   token(stream, state): string | null {
     // ── inside @() graft: code-highlight until the balanced close ──
@@ -643,12 +655,7 @@ export const parser: StreamParser<SchemeSugarcoatState> = {
 
     // ── round / square brackets ──
     if (ch === "(") {
-      // Peek the head word to detect `(define NAME …)`-style definitions so the
-      // bound name can read as a definition. We do NOT consume it — the head is
-      // tokenized on the next pass — we only set a flag if the head is a def form.
-      const rest = stream.string.slice(stream.pos);
-      const head = /^\s*([\w\-!$%&*+./<=>?@^~λ]+)/.exec(rest)?.[1];
-      state.afterDefineHead = head != null && DEFINITION_KEYWORDS.has(head) && head.startsWith("def");
+      state.atHead = true;
       return "paren";
     }
     if (ch === "[") {
@@ -657,12 +664,18 @@ export const parser: StreamParser<SchemeSugarcoatState> = {
       stream.next();
       return openDelim(state, kind);
     }
-    if (ch === ")") return "paren";
+    if (ch === ")") {
+      state.atHead = false;
+      state.afterDefineHead = false;
+      return "paren";
+    }
     if (ch === "]") return closeBracket(state);
 
     // ── leading-colon accessor `:key` ──
     if (ch === ":" && SYMBOL_BODY.test(stream.peek() ?? "")) {
       stream.eatWhile(SYMBOL_BODY);
+      state.atHead = false;
+      state.afterDefineHead = false;
       return KEY;
     }
 
@@ -697,7 +710,11 @@ export const parser: StreamParser<SchemeSugarcoatState> = {
     // ── numbers (non-prefixed decimal) ──
     if (/[-+0-9.]/.test(ch)) {
       stream.backUp(1);
-      if (stream.match(decimalMatcher)) return "number";
+      if (stream.match(decimalMatcher)) {
+        state.atHead = false;
+        state.afterDefineHead = false;
+        return "number";
+      }
       stream.next(); // not a number after all; fall through as a symbol char
     }
 
@@ -706,17 +723,26 @@ export const parser: StreamParser<SchemeSugarcoatState> = {
     // trailing-colon keyword pair `k:` — consume the colon and tag as a key.
     if (stream.peek() === ":") {
       stream.next();
+      state.atHead = false;
+      state.afterDefineHead = false;
       return KEY;
     }
     const word = stream.current();
 
+    const atHead = state.atHead;
+    state.atHead = false;
+
     if (state.afterDefineHead) {
-      // The token right after a definition head is the bound name.
+      // The token right after a definition head (or after `(define (`) is the bound name.
       state.afterDefineHead = false;
       // unless it is itself a keyword (e.g. nested lambda), then keep keyword.
       if (!DEFINITION_KEYWORDS.has(word) && !CONTROL_KEYWORDS.has(word)) return DEFNAME;
     }
 
+    if (atHead && DEFINITION_KEYWORDS.has(word) && word.startsWith("def")) {
+      state.afterDefineHead = true;
+    }
+    if (atHead && SPECIAL_HEADS.has(word)) return SPECIAL;
     if (DEFINITION_KEYWORDS.has(word)) return "definitionKeyword";
     if (CONTROL_KEYWORDS.has(word)) return "controlKeyword";
     return "variableName";
@@ -744,6 +770,7 @@ export const parser: StreamParser<SchemeSugarcoatState> = {
     [CURLY_ERR]: t.invalid,
     [ATCLOSE]: t.keyword, // @body close — pairs with ATOPEN, not code curlies
     [DEFNAME]: t.definition(t.variableName),
+    [SPECIAL]: t.keyword,
     [ATOPEN]: t.keyword, // @head{ — the tagged-template head reads as a keyword
     [INTERP]: t.variableName, // @id / @(…) / @|…| — interpolation pops against the prose
   },
