@@ -97,7 +97,7 @@ bytevector = '#u8(' , { atmosphere } , [ datum , { { atmosphere } , datum } , { 
 (* grammar.md §LITERALS. Comma and a lone JSON `:` are atmosphere here, not datums. *)
 vec-lit = '[' , { lit-atmosphere } , [ datum , { { lit-atmosphere } , datum } , { lit-atmosphere } ] , ']' ;
 dict-lit = '{' , { lit-atmosphere } , [ datum , { { lit-atmosphere } , datum } , { lit-atmosphere } ] , '}' ;
-lit-atmosphere = atmosphere | ',' | ':' ;
+lit-atmosphere = atmosphere | ',' | ?/:(?=$|[\s()[\]{}',])/? ;
 
 (* R7RS §7.1.2 labels. Sampling rarely emits them; the reader accepts them. *)
 label-def = ?/#\d+=/? , { atmosphere } , datum ;

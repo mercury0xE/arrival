@@ -150,6 +150,7 @@ export const ACCEPT: ReadonlyArray<{ readonly name: string; readonly input: stri
   { name: "quote-vec", input: "'[a b]" },
   { name: "vec-pair-shape", input: "[a 1]" },
   { name: "vec-adjacent", input: "[a(b)]" },
+  { name: "vec-keyword-semicolon", input: "[:;]" },
 
   // ── dicts ──
   { name: "dict-empty", input: "{}" },
@@ -169,6 +170,7 @@ export const ACCEPT: ReadonlyArray<{ readonly name: string; readonly input: stri
   { name: "quote-dict-suffix", input: "'{a: 1}" },
   { name: "dict-json-colon", input: '{"a": 1}' },
   { name: "dict-glued-string-colon", input: '{"a":1}' },
+  { name: "dict-keyword-semicolon-val", input: "{:a :;}" },
   { name: "qq-dict", input: "`{:a ,(+ 1 2)}" },
 
   // ── labels / attachment ──
