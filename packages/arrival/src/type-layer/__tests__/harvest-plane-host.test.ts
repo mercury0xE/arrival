@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { EnvCapability } from "../../common/capability.js";
 import { BASE_ROSTER } from "../../env/base-roster.js";
 import { harvestPlaneHost } from "../harvest-plane-host.js";
 
@@ -25,4 +26,30 @@ describe("harvestPlaneHost — name-level skip, not scheme/* prefix", () => {
     expect(names.has("member")).toBe(false);
     expect(names.has("string-split")).toBe(true);
   });
+
+  it("harvests record-shaped inputRest into kwargsMembers and preserves mixed positional + kwargs signatures", () => {
+    const cap = EnvCapability.define("test/host-kwargs", {
+      symbols: (symbol, z) => ({
+        "read-file": symbol.rosetta`read-file: mixed kwargs`(
+          { input: [z.string], inputRest: { offset: z.number.optional() }, output: [z.string] },
+          (p) => p,
+        ),
+        "pure-kw": symbol.rosetta`pure-kw: pure kwargs`(
+          { input: [], inputRest: { name: z.string }, output: [z.string] },
+          (opts) => opts.name,
+        ),
+        "var-plus": symbol.rosetta`var-plus: variadic rest`(
+          { input: [z.number], inputRest: z.number, output: [z.number] },
+          (a) => a,
+        ),
+      }),
+    });
+    const { entries, kwargsMembers } = harvestPlaneHost([cap], new Set());
+    expect(kwargsMembers).toEqual(["pure-kw", "read-file"]);
+    const byName = new Map(entries);
+    expect(byName.get("read-file")).toBe("(a: string, b?: { offset?: number }) => string");
+    expect(byName.get("pure-kw")).toBe("(a: { name: string }) => string");
+  });
 });
+
+

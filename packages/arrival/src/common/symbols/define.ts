@@ -56,13 +56,18 @@ export function define(tpl: TemplateStringsArray, ...sub: unknown[]): DefineFact
     // only `callable` tells the bind arm which runtime shape to build.
     const inSchema = isConstant ? normalizeVector([]) : normalizeInputVector(contract.input, contract.inputRest);
     const outSchema = isConstant ? normalizeVector([contract]) : normalizeVector(contract.output);
-    assertContractAxes(name, "define", { inSchema, outSchema });
+    const kwargsShape =
+      !isConstant && contract.inputRest !== undefined && !(contract.inputRest instanceof ZodType)
+        ? contract.inputRest
+        : undefined;
+    assertContractAxes(name, "define", { inSchema, outSchema, kwargsShape });
     const procedureContract = isConstant ? undefined : (contract as Contract<VectorSpec, VectorSpec, RestSpec>);
     return {
       kind: "define",
       name,
       doc,
       in: inSchema,
+      inputRest: procedureContract?.inputRest,
       out: outSchema,
       callable: !isConstant,
       singleOut: isConstant ? true : isSingleOutput(procedureContract!.output),

@@ -43,6 +43,21 @@ describe("slot-kind runtime gate (audit B2a)", () => {
         (() => "x") as never,
       ),
     ).toThrow(ContractSlotKindError);
+
+    // mixed positional + kwargs rest slots and variadic tuple rest slots are inside the gate's view
+    expect(() =>
+      symbol.rosetta`sk-r-mixed-kw: `(
+        { input: [z.string], inputRest: { v: z.schemeValue }, output: [z.string] } as never,
+        (() => "x") as never,
+      ),
+    ).toThrow(ContractSlotKindError);
+
+    expect(() =>
+      symbol.rosetta`sk-r-rest: `(
+        { input: [z.string], inputRest: z.schemeValue, output: [z.string] } as never,
+        (() => "x") as never,
+      ),
+    ).toThrow(ContractSlotKindError);
   });
 
   it("N-SLOT-KIND-NATIVE — z.dynamic / z.instance slot refuses at bake (untyped caller)", () => {
@@ -59,6 +74,20 @@ describe("slot-kind runtime gate (audit B2a)", () => {
 
     expect(() =>
       symbol.native`sk-n-out: `({ input: [z.schemeValue], output: [z.dynamic] } as never, ((v: unknown) => v) as never),
+    ).toThrow(ContractSlotKindError);
+
+    expect(() =>
+      symbol.native`sk-n-mixed-kw: `(
+        { input: [z.schemeValue], inputRest: { v: z.dynamic }, output: [z.schemeValue] } as never,
+        ((v: unknown) => v) as never,
+      ),
+    ).toThrow(ContractSlotKindError);
+
+    expect(() =>
+      symbol.native`sk-n-rest: `(
+        { input: [z.schemeValue], inputRest: z.dynamic, output: [z.schemeValue] } as never,
+        ((v: unknown) => v) as never,
+      ),
     ).toThrow(ContractSlotKindError);
   });
 

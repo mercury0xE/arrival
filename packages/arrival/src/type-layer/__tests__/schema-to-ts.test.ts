@@ -271,4 +271,20 @@ describe("signatureOf — the args-vector → function-signature composer", () =
     );
     expect(sig(def)).toBe('(a: { name: string; mode?: ("fast" | "scenic") | undefined }) => Promise<string>');
   });
+
+  it("composes a mixed positional + kwargs inputRest as positional params followed by the kwargs object param", () => {
+    const optKw = symbol.rosetta`read: mixed optional kwargs`(
+      { input: [z.string], inputRest: { offset: z.number.optional() }, output: [z.string] },
+      () => "",
+    );
+    expect(sig(optKw)).toBe("(a: string, b?: { offset?: number }) => Promise<string>");
+
+    const reqKw = symbol.rosetta`query: mixed required kwargs`(
+      { input: [z.string], inputRest: { limit: z.number, offset: z.number.optional() }, output: [z.string] },
+      () => "",
+    );
+    expect(sig(reqKw)).toBe("(a: string, b: { limit: number; offset?: number }) => Promise<string>");
+  });
 });
+
+

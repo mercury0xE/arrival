@@ -4,12 +4,14 @@
 // Tagged template carries `name: doc`; returns a generic so TS infers contract then checks
 // the impl against decoded types — wrong-typed impl is a compile error.
 
-import { ZodType } from "zod";
+import { ZodError, ZodType } from "zod";
+import * as z from "../scheme-zod/index.js";
 import { buildSlotAdopter } from "../../membrane/adopt-spine.js";
 import { ANativeProcedure, type NativeSymbolDef } from "../../values/primitives/ANativeProcedure.js";
 import { type SchemeValue } from "../../values/types.js";
 import { type CallCtx } from "../../run/CallCtx.js";
-import { decodeKwargsStrict } from "../kwargs-rejection.js";
+import { decodeKwargsStrict, drainDroppedKwargNotes } from "../kwargs-rejection.js";
+import { formatPositionalRejection } from "./positional-rejection.js";
 import {
   assertContractAxes,
   collectKwargsObject,
@@ -36,11 +38,14 @@ function native(tpl: TemplateStringsArray, ...sub: unknown[]) {
     assertNoResourcePathProducers(name, "native", contract as { queries?: unknown; effects?: unknown });
     const inSchema = normalizeInputVector(contract.input, contract.inputRest);
     const outSchema = normalizeVector(contract.output);
+    const kwargsShape: Record<string, import("zod").ZodTypeAny> | undefined =
+      contract.inputRest !== undefined && !(contract.inputRest instanceof ZodType) ? contract.inputRest : undefined;
     const provenance = contract.provenance ?? "pipe";
     const cacheClass = contract.cacheClass;
     const callbackRoles = assertContractAxes(name, "native", {
       inSchema,
       outSchema,
+      kwargsShape,
       provenance,
       cacheClass,
       declaredCallbackRoles: contract.callbackRoles,
@@ -50,8 +55,14 @@ function native(tpl: TemplateStringsArray, ...sub: unknown[]) {
     // array reads undefined.
     // Computed once; undefined when no slot adopts.
     const adoptArgs = buildSlotAdopter(contract.input, contract.inputRest);
-    const kwargsShape: Record<string, import("zod").ZodTypeAny> | undefined =
-      contract.inputRest !== undefined && !(contract.inputRest instanceof ZodType) ? contract.inputRest : undefined;
+    const items: readonly z.ZodTypeAny[] = Array.isArray(contract.input) ? contract.input : [];
+    const minPositional =
+      kwargsShape !== undefined && items.length > 0
+        ? items.reduceRight(
+            (acc, item, idx) => (acc === idx + 1 && item.safeParse(undefined).success ? idx : acc),
+            items.length,
+          )
+        : 0;
     const applyImpl = impl as (this: CallCtx, ...a: unknown[]) => unknown;
     // Interpreter args are untyped SchemeValues; impl wants the contract tuple.
     // Passthrough (no list slot) is the same widening — adoption is the typed path.
@@ -60,14 +71,30 @@ function native(tpl: TemplateStringsArray, ...sub: unknown[]) {
       ...args: readonly SchemeValue[]
     ) {
       if (kwargsShape !== undefined) {
-        const items = Array.isArray(contract.input) ? contract.input : [];
+        const decodeKw = (raw: Record<string, unknown>): unknown => {
+          const decoded = decodeKwargsStrict(name, kwargsShape, raw);
+          const dropped = drainDroppedKwargNotes(decoded);
+          if (dropped !== undefined) {
+            const sink = this.runCtx.notes;
+            for (const line of dropped) sink?.push(`${name}: ${line}`);
+          }
+          return decoded;
+        };
         if (items.length === 0) {
-          return applyImpl.apply(this, [decodeKwargsStrict(name, kwargsShape, collectKwargsObject(args))]);
+          return applyImpl.apply(this, [decodeKw(collectKwargsObject(args))]);
         }
         const { head, kwArgs } = splitAtFirstKeyword(args);
+        if (head.length < minPositional || head.length > items.length) {
+          try {
+            z.decode(inSchema, head);
+          } catch (error) {
+            if (error instanceof ZodError) throw new Error(formatPositionalRejection(name, error, head, inSchema));
+            throw error;
+          }
+        }
         const adopted = [...(adoptArgs === undefined ? head : adoptArgs(head as SchemeValue[]))];
         while (adopted.length < items.length) adopted.push(undefined);
-        const kwargs = decodeKwargsStrict(name, kwargsShape, collectKwargsObject(kwArgs));
+        const kwargs = decodeKw(collectKwargsObject(kwArgs));
         return applyImpl.apply(this, [...adopted, kwargs]);
       }
       const adopted = adoptArgs === undefined ? args : adoptArgs(args);
@@ -81,6 +108,7 @@ function native(tpl: TemplateStringsArray, ...sub: unknown[]) {
         name,
         doc,
         in: inSchema,
+        inputRest: contract.inputRest,
         out: outSchema,
         impl: hostImpl,
         type: contract.type,

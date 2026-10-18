@@ -12,6 +12,8 @@ import { ABool } from "../../values/primitives/ABool.js";
 import { ASymbol } from "../../values/primitives/ASymbol.js";
 import { symbol } from "../../symbol/index.js";
 import { testCallCtx } from "../../run/CallCtx.js";
+import { createNoteSink } from "../../run/note-sink.js";
+import { RunContext } from "../../run/RunContext.js";
 import * as z from "../scheme-zod/index.js";
 import { EnvCapability } from "../capability.js";
 
@@ -126,6 +128,33 @@ describe("mixed kwargs — UNIT (rosetta)", () => {
     expect(jsOf(out)).toBe("msg:undefined:true");
     expect(seen[0]).toEqual(["msg", undefined, { readonly: true }]);
   });
+
+  it("mixed positional + z.dynamic in inputRest preserves positional head and kwargs bag", async () => {
+    const seen: unknown[] = [];
+    const def = symbol.rosetta`send: mixed dynamic kwarg`(
+      {
+        input: [z.string],
+        inputRest: { payload: z.dynamic.optional() },
+        output: [z.string],
+      },
+      (target, opts) => {
+        seen.push([target, opts]);
+        return `${target}:${opts.payload}`;
+      },
+    );
+    const out = await fire(def, testCallCtx(), new AString("hello"), pluck("payload"), new AExact(42));
+    expect(jsOf(out)).toBe("hello:42");
+    expect(seen[0]).toEqual(["hello", { payload: new AExact(42) }]);
+  });
+
+  it("positional string starting with ':' is not mistaken for a keyword", async () => {
+    const def = symbol.rosetta`addr: join host and port`(
+      { input: [z.string, z.string], output: [z.string] },
+      (host, port) => `${host}${port}`,
+    );
+    const out = await fire(def, testCallCtx(), new AString("localhost"), new AString(":8080"));
+    expect(jsOf(out)).toBe("localhost:8080");
+  });
 });
 
 describe("mixed kwargs — UNIT (native)", () => {
@@ -142,6 +171,37 @@ describe("mixed kwargs — UNIT (native)", () => {
     expect(jsOf(out)).toBe("p:1");
     expect(seen[0]?.[1]).toEqual({ offset: 1 });
     expect(seen[0]?.[0]).toBeInstanceOf(AString);
+  });
+
+  it("rejects missing required positional or excess positionals before kwargs on native", () => {
+    const def = symbol.native`read: mixed native`(
+      { input: [z.string], inputRest: { offset: z.number.optional() }, output: [z.string] },
+      (path, opts) => new AString(`${String(path)}:${opts.offset}`),
+    );
+    expect(() => fire(def, testCallCtx(), pluck("offset"), new AExact(1))).toThrow(/read/);
+    expect(() =>
+      fire(def, testCallCtx(), new AString("a"), new AString("b"), pluck("offset"), new AExact(1)),
+    ).toThrow(/read/);
+  });
+
+  it("drains dropped unknown kwarg notes into runCtx.notes on native", () => {
+    const def = symbol.native`read: mixed native`(
+      { input: [z.string], inputRest: { offset: z.number.optional() }, output: [z.string] },
+      (path, opts) => new AString(`${String(path)}:${opts.offset}`),
+    );
+    const notes = createNoteSink();
+    const ctx = testCallCtx({ runCtx: new RunContext({ notes }) });
+    const out = fire(def, ctx, new AString("p"), pluck("offset"), new AExact(2), pluck("limit"), new AExact(9));
+    expect(jsOf(out)).toBe("p:2");
+    expect(notes.drain().some((n) => n.includes(":limit"))).toBe(true);
+  });
+
+  it("variadic z.dynamic inputRest enforces callable door on tail args", async () => {
+    const def = symbol.rosetta`act: dynamic rest`(
+      { input: [z.string], inputRest: z.dynamic, output: [z.string] },
+      (op, ...rest) => `${op}:${rest.length}`,
+    );
+    await expect(fire(def, testCallCtx(), new AString("op"), () => 1)).rejects.toThrow(/z\.dynamic slot \(argument 2\)/);
   });
 });
 
@@ -194,5 +254,19 @@ describe("mixed kwargs — INTEGRATION", () => {
     );
     await applyCapability(plusEnv, [EnvCapability.define("test/variadic-rest", { symbols: () => ({ plus }) })]);
     expect(jsOf((await execState(`(plus 1 2 3 4)`, { env: plusEnv })).values[0])).toBe(10);
+  });
+
+  it("Zod inputRest leaves keyword pairs for the impl to split", async () => {
+    const dynEnv = await freshEnv();
+    const act = symbol.rosetta`act: dynamic rest keeps keywords`(
+      { input: [z.string], inputRest: z.dynamic, output: [z.string] },
+      (op, ...rest) => {
+        const key = rest[0];
+        if (!(key instanceof ASymbol)) return `not-symbol:${typeof key}`;
+        return `${op}:${String(key)}:${jsOf(rest[1])}`;
+      },
+    );
+    await applyCapability(dynEnv, [EnvCapability.define("test/dynamic-keywords", { symbols: () => ({ act }) })]);
+    expect(jsOf((await execState(`(act "kv/set" :params "x")`, { env: dynEnv })).values[0])).toBe("kv/set::params:x");
   });
 });
