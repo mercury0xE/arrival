@@ -208,6 +208,12 @@ export class ASymbol extends AValue {
  * string) so the target decides how to fold/match it — no centralized accessor call here.
  */
 export class AKeywordSymbol extends ASymbol {
+  override ["arrival/toJS"](): string {
+    return typeof this.__name__ === "string" && this.__name__.startsWith(":")
+      ? this.__name__.slice(1)
+      : super["arrival/toJS"]();
+  }
+
   ["arrival/tagless-final/apply"](args: readonly SchemeValue[], callCtx: CallCtx, _canBounce = false): CallResult {
     if (args.length === 0) return this;
     const target = args[0] as unknown as Record<string, unknown> | null | undefined;

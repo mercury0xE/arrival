@@ -30,6 +30,8 @@ export interface RosettaMembrane {
   readonly hostImpl: (this: CallCtx, ...args: unknown[]) => unknown;
   readonly carriesCallable: boolean;
   readonly kwargsShape?: Record<string, ZodTypeAny>;
+  /** No `inputRest`: trailing keywords may be the optional last dict. A Zod rest stays a tuple. */
+  readonly foldTrailingKeywords: boolean;
   readonly checkDynamicSlots?: (decodedArgs: readonly unknown[]) => void;
   readonly unwrapOpaqueHandles?: (decodedArgs: readonly unknown[]) => readonly unknown[];
   readonly singleOut: boolean;

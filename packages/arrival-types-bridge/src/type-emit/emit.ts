@@ -2,8 +2,8 @@
  * COPY-AS-CHUNK (constitution §4.5 — greenfield package, never shared imports).
  * Source: arrival/packages/mercury/src/types-emit.ts (already carrying
  * Adaptations from the source chunk:
- *   - imports re-homed: parse/desugar/nodes/names/scheme-scope → `../front/`
- *     (`parseSexprs` is `@inhuman.tools/arrival-syntax`, re-exported from `../front/parse`),
+ *   - imports re-homed: parse/desugar/nodes/names/scheme-scope → `../front/` (this
+ *     package's copies; `parseSexprs` no longer imports `@inhuman.tools/arrival-sugarcoat`),
  *     stdlib → `./builtins.js` (roster-only reduction).
  *   - Law T: narrowing forms emit native `!`/`&&`/`||`/bare-call; other conditions
  *     coerce with `(expr !== false)` — Scheme truth (only `#f` is false).
@@ -33,7 +33,7 @@
  * every emitted construct records the IR span it came from, so a tsc diagnostic
  * at a TS offset lifts back onto the right `.scm` form.
  */
-import { desugar } from "../front/desugar.js";
+import { type AnnotatedListNode, desugar } from "../front/desugar.js";
 import {
   type Atom,
   head,
@@ -251,7 +251,9 @@ function emitKeywordAsFn(key: string, node: Node, ctx: Ctx): void {
   const kJson = JSON.stringify(key);
   // Type-position property: bare ident when legal, else quoted.
   const kType = TS_IDENT.test(key) ? key : kJson;
-  ctx.buf.raw(`<A,>(x: A): A extends { ${kType}: infer S } ? S : unknown => (x as any)[${kJson}]`);
+  ctx.buf.raw(
+    `<A,>(x: A): A extends { ${kType}: infer S } ? S : unknown => (x as any)[${kJson}]`,
+  );
   recordSpan(ctx, start, node);
 }
 
@@ -326,6 +328,18 @@ function emitList(n: ListNode, ctx: Ctx): void {
   if (isKeyword(h)) {
     const obj = n.list[1];
     const start = ctx.buf.offset;
+    const vfa = (n as AnnotatedListNode).variantFieldAccess;
+    if (vfa !== undefined && vfa.fieldName !== "kind") {
+      ctx.buf.raw("((");
+      if (obj) emitExpr(obj, ctx);
+      else ctx.buf.raw("undefined as unknown");
+      ctx.buf.raw(`) as Extract<typeof `);
+      if (obj) emitExpr(obj, ctx);
+      else ctx.buf.raw("undefined");
+      ctx.buf.raw(`, { readonly kind: ${JSON.stringify(vfa.tag)} }>)[${JSON.stringify(keywordName(h))}]`);
+      recordSpan(ctx, start, n);
+      return;
+    }
     ctx.buf.raw("(");
     if (obj) emitExpr(obj, ctx);
     else ctx.buf.raw("undefined as unknown");
@@ -712,7 +726,16 @@ function emitNarrowingForm(n: Node, ctx: Ctx): void {
  * reverse constraint wraps `List<…>`; result path indexes `[number]`.
  * (cdr is List→List — not in this set.)
  */
-const PIPELINE_ELEM_OPS = new Set(["last", "first", "car", "second", "third", "cadr", "caddr", "cadddr"]);
+const PIPELINE_ELEM_OPS = new Set([
+  "last",
+  "first",
+  "car",
+  "second",
+  "third",
+  "cadr",
+  "caddr",
+  "cadddr",
+]);
 
 /** One step of a pure unary pipeline (compose/pipe desugar, or hand-written). */
 type PipelineStep =
@@ -734,7 +757,7 @@ function extractUnaryPipeline(body: Node, param: Atom): PipelineStep[] | null {
   let cur: Node = body;
   for (;;) {
     if (isAtom(cur) && !cur.str && cur.atom === param.atom) {
-      return outerFirst.length === 0 ? null : [...outerFirst].reverse();
+      return outerFirst.length === 0 ? null : outerFirst.slice().reverse();
     }
     if (!isList(cur) || cur.list.length !== 2) return null;
     const h = cur.list[0]!;
@@ -768,7 +791,8 @@ function pipelineGenericTypes(steps: readonly PipelineStep[]): { constraint: str
   }
   let r = "A";
   for (const s of steps) {
-    r = s.kind === "field" ? `${r}[${JSON.stringify(s.key)}]` : `${r}[number]`;
+    if (s.kind === "field") r = `${r}[${JSON.stringify(s.key)}]`;
+    else r = `${r}[number]`;
   }
   return { constraint: c, result: r };
 }
@@ -783,7 +807,8 @@ const LIST_PRESERVE_OPS = new Set(["cdr", "cddr", "cdddr", "cddddr", "rest", "ta
 type DemandShape =
   | { kind: "any" }
   | { kind: "list"; elem: DemandShape; /** car/cadr/… when from pure chain; omitted when unknown */ slot?: string }
-  | { kind: "obj"; fields: Map<string, DemandShape> };
+  | { kind: "obj"; fields: Map<string, DemandShape> }
+  | { kind: "adt"; typeName: string; arity: number };
 
 const DEMAND_ANY: DemandShape = { kind: "any" };
 
@@ -793,9 +818,10 @@ function tryPureChain(expr: Node): { root: string; steps: PipelineStep[] } | nul
   let cur: Node = expr;
   for (;;) {
     if (isAtom(cur) && !cur.str) {
-      return outerFirst.length === 0 ? null : { root: cur.atom, steps: [...outerFirst].reverse() };
+      return outerFirst.length === 0 ? null : { root: cur.atom, steps: outerFirst.slice().reverse() };
     }
     if (!isList(cur) || cur.list.length !== 2) return null;
+    if ((cur as AnnotatedListNode).variantFieldAccess !== undefined) return null;
     const h = cur.list[0]!;
     const arg = cur.list[1]!;
     if (isKeyword(h)) {
@@ -816,10 +842,8 @@ function shapeFromSteps(steps: readonly PipelineStep[]): DemandShape {
   let s: DemandShape = DEMAND_ANY;
   for (let i = steps.length - 1; i >= 0; i--) {
     const step = steps[i]!;
-    s =
-      step.kind === "field"
-        ? { kind: "obj", fields: new Map([[step.key, s]]) }
-        : { kind: "list", elem: s, slot: step.op };
+    if (step.kind === "field") s = { kind: "obj", fields: new Map([[step.key, s]]) };
+    else s = { kind: "list", elem: s, slot: step.op };
   }
   return s;
 }
@@ -827,6 +851,7 @@ function shapeFromSteps(steps: readonly PipelineStep[]): DemandShape {
 /** Replace deepest `any` leaf with `leaf` (one-hop init: field chain → bound demand). */
 function substituteLeaf(s: DemandShape, leaf: DemandShape): DemandShape {
   if (s.kind === "any") return leaf;
+  if (s.kind === "adt") return s;
   if (s.kind === "list") {
     return { kind: "list", elem: substituteLeaf(s.elem, leaf), slot: s.slot };
   }
@@ -855,6 +880,9 @@ function objFieldsDisjoint(a: DemandShape & { kind: "obj" }, b: DemandShape & { 
 function joinShapes(a: DemandShape, b: DemandShape): DemandShape | null {
   if (a.kind === "any") return b;
   if (b.kind === "any") return a;
+  if (a.kind === "adt" && b.kind === "adt") {
+    return a.typeName === b.typeName && a.arity === b.arity ? a : null;
+  }
   if (a.kind === "list" && b.kind === "list") {
     // car vs cadr (different slots) with disjoint field sets → List<any>, not a
     // super-object. Same slot (two fields via car) still merges object keys.
@@ -895,13 +923,17 @@ function mergeDemand(into: Map<string, DemandShape>, name: string, shape: Demand
     return;
   }
   const j = joinShapes(prev, shape);
-  if (j === null)
-    into.delete(name); // conflict → no annotation
+  if (j === null) into.delete(name); // conflict → no annotation
   else into.set(name, j);
 }
 
 function renderShape(s: DemandShape): string {
   if (s.kind === "any") return "any";
+  if (s.kind === "adt") {
+    return s.arity > 0
+      ? `${s.typeName}<${Array.from({ length: s.arity }, () => "any").join(", ")}>`
+      : s.typeName;
+  }
   if (s.kind === "list") return `List<${renderShape(s.elem)}>`;
   const parts: string[] = [];
   for (const [k, v] of s.fields) {
@@ -913,12 +945,19 @@ function renderShape(s: DemandShape): string {
 
 function isNamedLetForm(n: ListNode): boolean {
   const h = head(n);
-  return (h === "let" || h === "let*" || h === "letrec" || h === "letrec*") && isAtom(n.list[1]) && !n.list[1]!.str;
+  return (
+    (h === "let" || h === "let*" || h === "letrec" || h === "letrec*") &&
+    isAtom(n.list[1]) &&
+    !n.list[1]!.str
+  );
 }
 
 function isPlainLetForm(n: ListNode): boolean {
   const h = head(n);
-  return (h === "let" || h === "let*" || h === "letrec" || h === "letrec*") && isList(n.list[1]);
+  return (
+    (h === "let" || h === "let*" || h === "letrec" || h === "letrec*") &&
+    isList(n.list[1])
+  );
 }
 
 /**
@@ -944,7 +983,10 @@ function collectComposeDomains(forest: readonly Node[]): Map<string, DemandShape
   return out;
 }
 
-function findFunctionDefine(forest: readonly Node[], name: string): { formals: string[]; body: Node[] } | null {
+function findFunctionDefine(
+  forest: readonly Node[],
+  name: string,
+): { formals: string[]; body: Node[] } | null {
   for (const form of forest) {
     if (!isList(form) || head(form) !== "define") continue;
     const sig = form.list[1];
@@ -962,7 +1004,10 @@ function findFunctionDefine(forest: readonly Node[], name: string): { formals: s
  * Lazy formal-shape analysis for a multi-arg function define.
  * e.g. frontier-of's `history` gets List<{ tagline; reactions }> from its map lambda.
  */
-function formalShapesOf(fnName: string, dctx: DemandHarvestCtx): Map<string, DemandShape> {
+function formalShapesOf(
+  fnName: string,
+  dctx: DemandHarvestCtx,
+): Map<string, DemandShape> {
   const cached = dctx.fnFormalShapes.get(fnName);
   if (cached !== undefined) return cached;
   if (dctx.visiting.has(fnName)) return new Map();
@@ -1029,20 +1074,31 @@ export const DEMAND_SOURCE_HEADS = [
  * Explicit opaque heads (demand stops — residual OK if named).
  * R5: formalShapesOf mutual-recursion cycle returns empty mid-visit (visible, not silent).
  */
-export const DEMAND_OPAQUE_HEADS = ["cut", "apply", "dict", "require", "case-lambda", "do"] as const;
+export const DEMAND_OPAQUE_HEADS = [
+  "cut",
+  "apply",
+  "dict",
+  "require",
+  "case-lambda",
+  "do",
+] as const;
 
 /**
  * Push a required shape through an argument expression onto free roots.
  * Handles: bare atom, LIST_DOMAIN_REVERSERS heads, pure field/elem chains.
  */
-function applyDomainToArg(arg: Node, domain: DemandShape, into: Map<string, DemandShape>): void {
+function applyDomainToArg(
+  arg: Node,
+  domain: DemandShape,
+  into: Map<string, DemandShape>,
+): void {
   if (isAtom(arg) && !arg.str) {
     mergeDemand(into, arg.atom, domain);
     return;
   }
   if (isList(arg) && domain.kind === "list") {
     const h = head(arg);
-    const rev = h === undefined ? undefined : LIST_DOMAIN_REVERSERS.get(h);
+    const rev = h !== undefined ? LIST_DOMAIN_REVERSERS.get(h) : undefined;
     if (rev !== undefined) {
       const args = arg.list.slice(1);
       switch (rev.kind) {
@@ -1102,7 +1158,11 @@ function harvestLetLike(
  * element push, and fused callee formal domains (compose + multi-arg defines).
  * Join is structural meet — never drop a demand for a second consumer.
  */
-function collectDemandsInNode(n: Node, into: Map<string, DemandShape>, dctx: DemandHarvestCtx): void {
+function collectDemandsInNode(
+  n: Node,
+  into: Map<string, DemandShape>,
+  dctx: DemandHarvestCtx,
+): void {
   if (!isList(n) || isNil(n)) return;
 
   // Named let: body demands + reverse one-hop through inits → outer free roots.
@@ -1135,6 +1195,16 @@ function collectDemandsInNode(n: Node, into: Map<string, DemandShape>, dctx: Dem
     }
     harvestLetLike(pairs, bodyForms, into, dctx);
     return;
+  }
+
+  // Variant field / kind access from `match` → target demands the ADT union type.
+  const vfa = (n as AnnotatedListNode).variantFieldAccess;
+  if (vfa !== undefined && n.list[1] !== undefined) {
+    applyDomainToArg(
+      n.list[1]!,
+      { kind: "adt", typeName: vfa.typeName, arity: vfa.typeParams.length },
+      into,
+    );
   }
 
   // This form as a pure chain.
@@ -1176,11 +1246,11 @@ function collectDemandsInNode(n: Node, into: Map<string, DemandShape>, dctx: Dem
       const local = new Map<string, DemandShape>();
       for (const b of lamBody) collectDemandsInNode(b, local, dctx);
       // Multi-list zip: param i ↔ list arg at index 2+i
-      for (const [i, param] of params.entries()) {
-        if (param!.rest) break;
+      for (let i = 0; i < params.length; i++) {
+        if (params[i]!.rest) break;
         const listArg = n.list[2 + i];
         if (listArg === undefined) break;
-        const s = local.get(param!.atom.atom);
+        const s = local.get(params[i]!.atom.atom);
         if (s !== undefined && s.kind !== "any") {
           applyDomainToArg(listArg, { kind: "list", elem: s }, into);
         }
@@ -1262,9 +1332,13 @@ function isFalseLiteral(n: Node): boolean {
  * Without this, `(let walk ((click #f)) (:tagline click) …)` annotates only the
  * object arm and rejects the seed / recursive `false` arm.
  */
-function unionFalseWhenInitF(demands: Map<string, string>, names: readonly string[], inits: readonly Node[]): void {
-  for (const [i, name_] of names.entries()) {
-    const name = name_!;
+function unionFalseWhenInitF(
+  demands: Map<string, string>,
+  names: readonly string[],
+  inits: readonly Node[],
+): void {
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i]!;
     const ann = demands.get(name);
     if (ann === undefined) continue;
     if (!isFalseLiteral(inits[i]!)) continue;
@@ -1274,7 +1348,11 @@ function unionFalseWhenInitF(demands: Map<string, string>, names: readonly strin
 }
 
 /** Write `(a: T, b, ...rest)` using demand annotations when present. */
-function emitAnnotatedParams(params: { atom: Atom; rest: boolean }[], demands: Map<string, string>, ctx: Ctx): void {
+function emitAnnotatedParams(
+  params: { atom: Atom; rest: boolean }[],
+  demands: Map<string, string>,
+  ctx: Ctx,
+): void {
   for (const [idx, p] of params.entries()) {
     if (idx > 0) ctx.buf.raw(", ");
     if (p.rest) ctx.buf.raw("...");
@@ -1314,7 +1392,9 @@ function emitLambda(n: ListNode, ctx: Ctx): void {
         ctx.buf.raw(`<A extends ${constraint}>(${pname}: A): ${result} => `);
         emitArrowBody(bodyForms, ctx);
       } else {
-        ctx.buf.raw(`<A,>(${pname}: A): A extends ${constraint} ? ${result} : unknown => ((${pname}: any) => `);
+        ctx.buf.raw(
+          `<A,>(${pname}: A): A extends ${constraint} ? ${result} : unknown => ((${pname}: any) => `,
+        );
         emitArrowBody(bodyForms, ctx);
         ctx.buf.raw(`)(${pname})`);
       }
@@ -1582,6 +1662,10 @@ function emitStmtInner(form: Node, ctx: Ctx): void {
 }
 
 function emitDefine(n: ListNode, ctx: Ctx): void {
+  const annotated = n as AnnotatedListNode;
+  if (annotated.variantTypeMeta !== undefined) {
+    ctx.buf.raw(`${annotated.variantTypeMeta.tsUnionDeclaration}\n`);
+  }
   const start = ctx.buf.offset;
   const sig = n.list[1];
   if (isList(sig)) {
@@ -1591,12 +1675,46 @@ function emitDefine(n: ListNode, ctx: Ctx): void {
     if (nameAtom) ctx.declaredNames.set(name, nameAtom.atom);
     const params = paramAtoms({ list: sig.list.slice(1) });
     const bodyForms = n.list.slice(2);
+    const kw = ctx.setVars.has(name) ? "let" : "const";
+    if (annotated.variantCtorMeta !== undefined) {
+      const vc = annotated.variantCtorMeta;
+      const usedTypeParams = new Set(vc.fields.map((f) => f.schemeType));
+      const typeParamDecl =
+        vc.typeParams.length > 0
+          ? `<${vc.typeParams.map((p) => (usedTypeParams.has(p) ? p.toUpperCase() : `${p.toUpperCase()} = never`)).join(", ")}>`
+          : "";
+      const returnTypeArgs = vc.typeParams.length > 0 ? `<${vc.typeParams.map((p) => p.toUpperCase()).join(", ")}>` : "";
+      const paramList = params
+        .map((p, i) => `${emitName(p.atom, ctx)}: ${vc.fields[i]?.tsType ?? "unknown"}`)
+        .join(", ");
+      const fieldEntries = params
+        .map((p, i) => {
+          const fk = vc.fields[i]?.name ?? p.atom.atom;
+          const key = TS_IDENT.test(fk) ? fk : JSON.stringify(fk);
+          return `, ${key}: ${emitName(p.atom, ctx)}`;
+        })
+        .join("");
+      ctx.buf.raw(
+        `${kw} ${name} = ${typeParamDecl}(${paramList}): ${vc.typeName}${returnTypeArgs} => ({ kind: ${JSON.stringify(vc.tag)} as const${fieldEntries} })`,
+      );
+      recordSpan(ctx, start, n);
+      return;
+    }
+    if (annotated.variantPredMeta !== undefined) {
+      const vp = annotated.variantPredMeta;
+      const pName = params[0] ? emitName(params[0].atom, ctx) : "__x";
+      const typeArgs = vp.typeParams.length > 0 ? `<${vp.typeParams.map(() => "unknown").join(", ")}>` : "";
+      ctx.buf.raw(
+        `${kw} ${name} = (${pName}: unknown): ${pName} is Extract<${vp.typeName}${typeArgs}, { readonly kind: ${JSON.stringify(vp.tag)} }> => (typeof ${pName} === "object" && ${pName} !== null && (${pName} as { readonly kind?: unknown }).kind === ${JSON.stringify(vp.tag)})`,
+      );
+      recordSpan(ctx, start, n);
+      return;
+    }
     const demands = demandsForFormals(
       bodyForms,
       params.filter((p) => !p.rest).map((p) => p.atom.atom),
       ctx.demandCtx,
     );
-    const kw = ctx.setVars.has(name) ? "let" : "const";
     ctx.buf.raw(`${kw} ${name} = (`);
     emitAnnotatedParams(params, demands, ctx);
     ctx.buf.raw(") => ");

@@ -1,4 +1,4 @@
-# @inhuman.tools/arrival
+# @here.build/arrival
 
 Sandboxed R7RS-subset Scheme for LLM agents. `exec` runs a string and returns
 plain JS — transparent provenance, a capability sandbox, a JS membrane.
@@ -16,11 +16,11 @@ translate English-reasoning into a tool-call, this is for you.
 ## Quick Start
 
 ```bash
-npm install @inhuman.tools/arrival
+npm install @here.build/arrival
 ```
 
 ```typescript
-import { exec } from "@inhuman.tools/arrival";
+import { exec } from "@here.build/arrival";
 
 // One plain JS value per top-level form; the base assembles lazily on first call.
 const [result] = await exec(`(filter (lambda (x) (> x 5)) (list 1 3 7 9 2))`);
@@ -36,7 +36,7 @@ implementation. `exec` always assembles `BASE_ROSTER` and then the caller's `cap
 returns plain JS values — one per top-level form.
 
 ```typescript
-import { exec, EnvCapability } from "@inhuman.tools/arrival";
+import { exec, EnvCapability } from "@here.build/arrival";
 
 const weather = EnvCapability.define("demo/weather", {
   symbols: (symbol, z) => ({
@@ -64,8 +64,8 @@ gives it an `s/*` type and a default; the host supplies the value through the `o
 capability's shared config bag, validated against the declared type at the membrane.
 
 ```typescript
-import { exec } from "@inhuman.tools/arrival";
-import { overridableCapability } from "@inhuman.tools/arrival/capabilities/overridable";
+import { exec } from "@here.build/arrival";
+import { overridableCapability } from "@here.build/arrival/capabilities/overridable";
 
 const users = [
   { id: "alice", priority: 15 },
@@ -92,7 +92,7 @@ Multi-turn agent sessions need no framework and no hidden layer: mint a scope, r
 top-level `define`s accumulate across calls.
 
 ```typescript
-import { execState, toJS, LexicalScope } from "@inhuman.tools/arrival";
+import { execState, toJS, LexicalScope } from "@here.build/arrival";
 
 const scope = LexicalScope.fresh("agent-session"); // the session's mutable frame
 await execState(`(define (sq x) (* x x))`, { scope }); // turn 1 — defines land on the scope
@@ -121,9 +121,11 @@ single construction site), the **full R7RS exception tower**, an **exact numeric
 (safe-integer `AExact` — num/denom are JS safe integers; arithmetic that overflows
 throws; host `bigint` is not a Scheme number — `(+ (/ 1 3) (/ 2 3))` is exactly `1`),
 **datum labels**. Twelve SRFIs
-assemble by default (1, 2, 8, 13, 26, 28, 43, 95, 128, 151, 189, 235 — `src/env/srfi/`); the
-deliberately-absent ones (hash tables, random, time/date, …) are doored stubs naming why they're
-out and what to use instead — exactly the symbols an LLM agent predictably reaches for.
+assemble by default (1, 2, 8, 13, 26, 28, 43, 95, 128, 151, 189, 235 — `src/env/srfi/`);
+SRFI-8 (`receive`) is a teaching door — user-facing multiple-value binders are omitted by
+design. The other deliberately-absent families (hash tables, random, time/date, …) are
+doored stubs naming why they're out and what to use instead — exactly the symbols an LLM
+agent predictably reaches for.
 
 The language stance — an R7RS-small sandboxed base, a forgiving superset layered _under_ strict
 (never beside it), the reserved-zone rule keeping it non-conflicting with any SRFI — is the charter;
@@ -147,8 +149,8 @@ role (`source` / `pipe` / `fan` / `sink` / `transparent` / `loop` / `opaque`).
 [`docs/PROVENANCE.md`](./docs/PROVENANCE.md).
 
 ```typescript
-import { execState, deepProvenance, EnvCapability } from "@inhuman.tools/arrival";
-import { EvalTrace } from "@inhuman.tools/arrival/provenance";
+import { execState, deepProvenance, EnvCapability } from "@here.build/arrival";
+import { EvalTrace } from "@here.build/arrival/provenance";
 
 const weather = EnvCapability.define("demo/weather", {
   symbols: (symbol, z) => ({
@@ -169,15 +171,16 @@ trace.toolNameFor(1); // "forecast-for"
 ```
 
 `buildUneval` reverse-slices a traced run into a minimal re-runnable program that re-derives a
-chosen value. It lives in `@inhuman.tools/arrival-provenance`. That
-package also owns `groundingVerdict` and the `whyOf` / `whereOf` / `howOf` queries; this package
+chosen value. It lives in `@here.build/arrival-provenance/analysis`. That package also
+owns `groundingVerdict` (`@here.build/arrival-provenance/verdict`) and the `whyOf` /
+`whereOf` / `howOf` queries (`@here.build/arrival-provenance/reflect`); this package
 keeps the capture spine (`EvalTrace`, stamping) and `deepProvenance`. The `/attestation` subpath
 brands values so provenance unions forward while attestation _drops on compute_.
 
 ```typescript
-import { execState, EnvCapability } from "@inhuman.tools/arrival";
-import { EvalTrace } from "@inhuman.tools/arrival/provenance";
-import { buildUneval } from "@inhuman.tools/arrival-provenance/analysis";
+import { execState, EnvCapability } from "@here.build/arrival";
+import { EvalTrace } from "@here.build/arrival/provenance";
+import { buildUneval } from "@here.build/arrival-provenance/analysis";
 
 const scanner = EnvCapability.define("demo/scanner", {
   symbols: (symbol, z) => ({
@@ -273,8 +276,9 @@ consumers skip the pass for such programs (the runtime doors remain the backstop
   `runCtx` (reuse an existing `RunContext` for REPL continuity), `staticValidation: "on" | "off"`
   (default `"off"`), `signal`, `budgetMs` (opt-in wall-clock bound; `signal` is the one that
   reaches into native calls), `strict` (turns off nil-tolerance,
-  caller-scoped), `tap` (trace recording).
-- `parse(code)` — the reader, standalone (`tokenize` lives on `/lsp-internals`).
+  caller-scoped), `tap` (trace recording). Full field list (effects, cache/replay, `program`,
+  `resolver`, …): [`docs/execution.md`](./docs/execution.md).
+- `parse(code)` — the reader, standalone; `async`, returns `Promise<SchemeValue[]>` (`tokenize` lives on `/lsp-internals`).
 
 **Declaration**
 
@@ -291,13 +295,13 @@ consumers skip the pass for such programs (the runtime doors remain the backstop
 
 - `validateProgram` / `vocabularyFromChain` (from `/lsp-internals`) — the complete-diagnostic-list
   validation pass.
-- `forwardCone`, `backwardCone` (from `@inhuman.tools/arrival-provenance/analysis`) — the traced
+- `forwardCone`, `backwardCone` (from `@here.build/arrival-provenance/analysis`) — the traced
   lineage cone; `deepProvenance` (from this package) — the deep provenance read; `toJS` —
   the boxed→plain exit read.
 - `EvalTrace` (from `/provenance`) — the traced-run recorder (capture spine lives in core);
   `trace.toolNameFor(id)` / `trace.invocationById(id)` resolve a `deepProvenance` ordinal to the
   verb / invocation that minted it.
-- `buildUneval` (from `@inhuman.tools/arrival-provenance/analysis`) — reverse
+- `buildUneval` (from `@here.build/arrival-provenance/analysis`) — reverse
   slicer over a finished traced run; options take `scope: state.scope` (not `env`).
 
 **Subpath exports** — granular, tree-shaken entries (see `package.json` `exports` for the
@@ -305,7 +309,7 @@ authoritative list): `/reflect-internals`, `/lsp-internals`, `/host-internals`, 
 `/capabilities`, `/capabilities/overridable`, `/capabilities/schema`,
 `/resources`, `/emit`, `/schema-tag`, `/attestation`, `/provenance`, `/provenance/store`,
 `/type-layer`. `/grammar.ebnf` is the reader eBNF (raw text, not JS). `(require …)` lives in
-`@inhuman.tools/arrival-modules`.
+`@here.build/arrival-modules`.
 
 **Decomposed processing** — for cases the three declared doors (`capabilities` / `config` /
 `scope`) don't cover: the self-hosted `Vocabulary` a capability tuple builds into is memoized by
@@ -326,8 +330,8 @@ host globals (`window` / `global` / `process` / `require`). But at 0.x, sandbox 
 feasible — at least via property access and some rosetta-layer aspects — so do not yet treat the
 isolation as a hard security boundary for untrusted input.
 
-Bare `exec` / `execState` calls (no explicit `scope`) mint a fresh scope per call —
-`scope ?? LexicalScope.fresh()` — so top-level `define`s do **not** accumulate across bare calls.
+Bare `exec` / `execState` calls (no explicit `scope`) mint a fresh isolated scope per
+call, so top-level `define`s do **not** accumulate across bare calls.
 Cross-call accumulation is opt-in: pass the same `LexicalScope` (minted once via
 `LexicalScope.fresh()`) on every call that should share bindings, as the Sessions section shows.
 Multi-tenant hosts that want isolation get it by default; multi-turn sessions opt into a shared
@@ -336,7 +340,7 @@ scope deliberately.
 **Do not**: expose to untrusted user input without additional isolation; use in security-critical
 contexts; deploy without containerization; trust sandbox isolation.
 
-Responsible disclosure and collaboration on improvements: security@here.build
+Responsible disclosure: [SECURITY.md](../../SECURITY.md) / security@here.build
 
 ## Performance
 
@@ -352,6 +356,7 @@ the _target's_ concern and interpretation cost stays an authoring-time property,
   keystone, the value plane, the membrane, provenance, the surface rules.
 - [`docs/PROVENANCE.md`](./docs/PROVENANCE.md) — the provenance substrate in full.
 - [`docs/writing-capabilities.md`](./docs/writing-capabilities.md) — authoring your own capabilities.
+- [`docs/README.md`](./docs/README.md) — implementer codemap (grammar, membrane, environments, …).
 
 ## Why Scheme for AI Agents?
 

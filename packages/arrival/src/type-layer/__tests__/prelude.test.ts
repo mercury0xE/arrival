@@ -84,4 +84,18 @@ describe("assembleHarvestedPrelude — grant tool defs → lens prelude", () => 
     expect(check('(create_user :name "Ada" :mode "teleport")')).toBeGreaterThan(0);
     expect(check('(create_user :mode "fast")')).toBeGreaterThan(0);
   });
+
+  it("a mixed positional + kwargs tool type-checks with or without optional kwargs and bites on bad types", () => {
+    const readFile = symbol.rosetta`read_file: read a file`(
+      { input: [z.string], inputRest: { offset: z.number.optional() }, output: [z.string] },
+      () => "",
+    );
+    const { prelude } = assembleHarvestedPrelude([["read_file", readFile]]);
+    const check = (scheme: string): number => compileErrors(`${prelude}\n${lower(scheme).ts};\n`).length;
+    expect(check('(read_file "a.txt")')).toBe(0);
+    expect(check('(read_file "a.txt" :offset 10)')).toBe(0);
+    expect(check('(read_file "a.txt" :offset "bad")')).toBeGreaterThan(0);
+    expect(check("(read_file 42 :offset 10)")).toBeGreaterThan(0);
+  });
 });
+

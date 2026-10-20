@@ -240,6 +240,34 @@ export function freeVars(form: unknown, opts: FreeVarsOptions = {}): Set<string>
             }
             return;
           }
+          case "define-variant":
+            return;
+          case "match": {
+            if (!isPair(n.cdr)) return;
+            walk(n.cdr.car, bound);
+            for (const clause of chainOf(n.cdr.cdr)) {
+              if (!isPair(clause)) continue;
+              const pat = clause.car;
+              if (isPair(pat)) {
+                const patParts = chainOf(pat);
+                const patVars: string[] = [];
+                for (const p of patParts.slice(1)) {
+                  if (isSymbol(p)) {
+                    const pn = nameOf(p);
+                    if (pn !== null && pn !== "_") patVars.push(pn);
+                  }
+                }
+                walkBody(clause.cdr, new Set([...bound, ...patVars]));
+              } else if (isSymbol(pat)) {
+                const pn = nameOf(pat);
+                const inner = pn !== null && pn !== "else" && pn !== "_" ? new Set([...bound, pn]) : bound;
+                walkBody(clause.cdr, inner);
+              } else {
+                walkBody(clause.cdr, bound);
+              }
+            }
+            return;
+          }
           case "begin":
           case "if":
           case "when":

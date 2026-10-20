@@ -41,7 +41,7 @@ import type { DoorCause } from "../common/symbols/_bake.js";
 import { APair } from "../values/primitives/APair.js";
 import { ASymbol } from "../values/primitives/ASymbol.js";
 import { suggestFromVocabulary } from "../unbound-variable.js";
-import { collectReferences, definitionOf, type MacroWalkAttribute } from "./collect-references.js";
+import { collectReferences, definitionOf, variantDefinitionsOf, type MacroWalkAttribute } from "./collect-references.js";
 import { buildReferenceGraph, type DoorNode, type MissingConfigNode, type ReferenceNode } from "./reference-graph.js";
 import type { ProgramVocabulary, VocabularyEntry } from "./vocabulary.js";
 
@@ -120,6 +120,9 @@ function collectProgramDefinitions(forms: readonly SchemeValue[]): {
         cur = cur.cdr;
       }
       return;
+    }
+    for (const vn of variantDefinitionsOf(form)) {
+      values.add(vn);
     }
     const def = definitionOf(form);
     if (def === null) return;

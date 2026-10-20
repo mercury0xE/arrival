@@ -2343,6 +2343,320 @@ function foldSubstitutedDictKey(v: SchemeValue): string {
 }
 
 // ============================================================================
+// Structural ADTs: define-variant & exhaustive match
+// ============================================================================
+
+interface VariantRuntimeDef {
+  readonly typeName: string;
+  readonly variantName: string;
+  readonly tag: string;
+  readonly fields: readonly string[];
+  readonly allVariants: readonly string[];
+}
+
+const VARIANT_BY_CONSTRUCTOR = new WeakMap<object, VariantRuntimeDef>();
+
+function variantTagOf(name: string): string {
+  return name
+    .replaceAll(/([a-z0-9])([A-Z])/g, "$1-$2")
+    .replaceAll(/([A-Z]+)([A-Z][a-z])/g, "$1-$2")
+    .toLowerCase();
+}
+
+// eslint-disable-next-line require-yield, sonarjs/generator-without-yield -- trampoline protocol: binds variant constructors and predicates synchronously
+function* evalDefineVariant(rest: SchemeValue, ctx: EvalContext): EvalGenerator {
+  SpecialFormShapeError.invariant(rest instanceof APair, "define-variant", "missing type header");
+
+  const typeHeader = rest.car;
+  let typeName: string;
+  if (typeHeader instanceof ASymbol) {
+    typeName = symbol_name(typeHeader);
+  } else if (typeHeader instanceof APair && typeHeader.car instanceof ASymbol) {
+    typeName = symbol_name(typeHeader.car);
+  } else {
+    throw new SpecialFormShapeError("define-variant", "expected symbol or (TypeName param...) header");
+  }
+
+  const clausesNode = rest.cdr;
+  SpecialFormShapeError.invariant(
+    clausesNode instanceof APair,
+    "define-variant",
+    "expected at least one variant clause",
+  );
+
+  const parsedClauses: Array<{
+    readonly variantSym: ASymbol;
+    readonly variantName: string;
+    readonly tag: string;
+    readonly fields: readonly string[];
+  }> = [];
+
+  let cursor: SchemeValue = clausesNode;
+  while (cursor instanceof APair) {
+    const clause = normalizeClause(cursor.car, "define-variant");
+    SpecialFormShapeError.invariant(
+      clause instanceof APair && clause.car instanceof ASymbol,
+      "define-variant",
+      "expected (VariantName (field type)...) clause",
+    );
+    const variantSym = clause.car;
+    const variantName = symbol_name(variantSym);
+    const fields: string[] = [];
+    let fieldCursor: SchemeValue = clause.cdr;
+    while (fieldCursor instanceof APair) {
+      const fSpec = normalizeClause(fieldCursor.car, "define-variant");
+      if (fSpec instanceof APair && fSpec.car instanceof ASymbol) {
+        fields.push(symbol_name(fSpec.car));
+      } else if (fSpec instanceof ASymbol) {
+        fields.push(symbol_name(fSpec));
+      } else {
+        throw new SpecialFormShapeError(
+          "define-variant",
+          `variant ${variantName}: expected (fieldName fieldType) or symbol field spec`,
+        );
+      }
+      fieldCursor = fieldCursor.cdr;
+    }
+    parsedClauses.push({
+      variantSym,
+      variantName,
+      tag: variantTagOf(variantName),
+      fields,
+    });
+    cursor = cursor.cdr;
+  }
+
+  const allVariants = parsedClauses.map((c) => c.variantName);
+  const closureResolver = ctxResolver(ctx);
+  const resolver = closureResolver as LexicalScopeWithInternals<Resolver>;
+
+  for (const { variantSym, variantName, tag, fields } of parsedClauses) {
+    const def: VariantRuntimeDef = { typeName, variantName, tag, fields, allVariants };
+    const ctor = new ALambda({
+      name: variantName,
+      arity: { min: fields.length, max: fields.length },
+      scope: closureResolver,
+      runner: (values: readonly SchemeValue[]) => {
+        if (values.length !== fields.length) {
+          throw new EvalError(
+            `${variantName}: expected ${fields.length} argument${fields.length === 1 ? "" : "s"}, got ${values.length}`,
+            { code: "E-VARIANT-ARITY" },
+          );
+        }
+        const pairs: Array<readonly [DictKey, SchemeValue]> = [
+          [new ASymbol(":kind"), new ASymbol(`:${tag}`)],
+          ...fields.map((f, i) => [new ASymbol(`:${f}`), values[i]] as const),
+        ];
+        return new ADict(pairs, unionProvenance(values));
+      },
+    });
+    ctor.__name__ = variantName;
+    ctor.__params__ = [...fields];
+    VARIANT_BY_CONSTRUCTOR.set(ctor, def);
+    resolver.env.bind(variantSym, ctor);
+
+    const predName = `${variantName}?`;
+    const pred = new ALambda({
+      name: predName,
+      arity: { min: 1, max: 1 },
+      scope: closureResolver,
+      runner: (values: readonly SchemeValue[]) => {
+        if (values.length !== 1) {
+          throw new EvalError(`${predName}: expected 1 argument, got ${values.length}`, {
+            code: "E-VARIANT-ARITY",
+          });
+        }
+        const v = values[0];
+        let matches = false;
+        if (v instanceof ADict) {
+          const k = v.get("kind");
+          if (k instanceof ASymbol) {
+            const kn = symbol_name(k);
+            matches = kn === `:${tag}` || kn === tag;
+          } else if (k instanceof AString) {
+            matches = k.valueOf() === tag;
+          }
+        }
+        const b = matches ? schemeTrue : schemeFalse;
+        return v instanceof AValue && v.provenance.size > 0 ? b.withProvenance(v.provenance) : b;
+      },
+    });
+    pred.__name__ = predName;
+    pred.__params__ = ["x"];
+    resolver.env.bind(new ASymbol(predName), pred);
+  }
+
+  return theVoid;
+}
+
+function* evalMatch(rest: SchemeValue, ctx: EvalContext): EvalGenerator {
+  SpecialFormShapeError.invariant(rest instanceof APair, "match", "missing target expression");
+
+  const targetExpr = rest.car;
+  const clausesRest = rest.cdr;
+  SpecialFormShapeError.invariant(clausesRest instanceof APair, "match", "expected at least one match clause");
+
+  type ParsedMatchClause =
+    | {
+        readonly kind: "variant";
+        readonly variantName: string;
+        readonly tag: string;
+        readonly fields: readonly string[] | undefined;
+        readonly patVars: readonly ASymbol[];
+        readonly body: SchemeValue;
+      }
+    | {
+        readonly kind: "catch-all";
+        readonly bindVar: ASymbol | null;
+        readonly body: SchemeValue;
+      };
+
+  const parsedClauses: ParsedMatchClause[] = [];
+  const coveredVariants = new Set<string>();
+  let family: VariantRuntimeDef | undefined;
+  let hasCatchAll = false;
+
+  let clauseCursor: SchemeValue = clausesRest;
+  while (clauseCursor instanceof APair) {
+    const clause = normalizeClause(clauseCursor.car, "match");
+    SpecialFormShapeError.invariant(clause instanceof APair, "match", "expected (pattern body...) clause");
+    const pat = normalizeClause(clause.car, "match");
+    const body = clause.cdr;
+    SpecialFormShapeError.invariant(body instanceof APair, "match", "match clause missing body");
+
+    if (pat instanceof ASymbol) {
+      const lit = pat.literal();
+      if (lit === "else" || lit === "_") {
+        hasCatchAll = true;
+        parsedClauses.push({ kind: "catch-all", bindVar: null, body });
+      } else {
+        const resolved = ctxResolver(ctx).lookup(pat.__name__, ctx.runCtx);
+        const vDef = resolved && typeof resolved === "object" ? VARIANT_BY_CONSTRUCTOR.get(resolved) : undefined;
+        if (vDef !== undefined) {
+          if (vDef.fields.length !== 0) {
+            throw new EvalError(
+              `match: variant ${vDef.variantName} expects ${vDef.fields.length} field pattern${vDef.fields.length === 1 ? "" : "s"} (${vDef.fields.join(", ")}), got 0`,
+              { code: "E-MATCH-ARITY" },
+            );
+          }
+          family ??= vDef;
+          coveredVariants.add(vDef.variantName);
+          parsedClauses.push({
+            kind: "variant",
+            variantName: vDef.variantName,
+            tag: vDef.tag,
+            fields: vDef.fields,
+            patVars: [],
+            body,
+          });
+        } else {
+          hasCatchAll = true;
+          parsedClauses.push({ kind: "catch-all", bindVar: pat, body });
+        }
+      }
+    } else if (pat instanceof APair && pat.car instanceof ASymbol) {
+      const headSym = pat.car;
+      const variantName = symbol_name(headSym);
+      const patVars: ASymbol[] = [];
+      let pCur: SchemeValue = pat.cdr;
+      while (pCur instanceof APair) {
+        SpecialFormShapeError.invariant(
+          pCur.car instanceof ASymbol,
+          "match",
+          `pattern variable in (${variantName} ...) must be a symbol`,
+        );
+        patVars.push(pCur.car);
+        pCur = pCur.cdr;
+      }
+      const resolved = ctxResolver(ctx).lookup(headSym.__name__, ctx.runCtx);
+      const vDef = resolved && typeof resolved === "object" ? VARIANT_BY_CONSTRUCTOR.get(resolved) : undefined;
+      if (vDef !== undefined) {
+        if (patVars.length !== vDef.fields.length) {
+          throw new EvalError(
+            `match: variant ${variantName} expects ${vDef.fields.length} field pattern${vDef.fields.length === 1 ? "" : "s"} (${vDef.fields.join(", ")}), got ${patVars.length}`,
+            { code: "E-MATCH-ARITY" },
+          );
+        }
+        family ??= vDef;
+      }
+      coveredVariants.add(variantName);
+      parsedClauses.push({
+        kind: "variant",
+        variantName,
+        tag: vDef ? vDef.tag : variantTagOf(variantName),
+        fields: vDef?.fields,
+        patVars,
+        body,
+      });
+    } else {
+      throw new SpecialFormShapeError("match", "expected (VariantName var...) or else/_ pattern");
+    }
+
+    clauseCursor = clauseCursor.cdr;
+  }
+
+  if (family !== undefined && !hasCatchAll) {
+    const missing = family.allVariants.filter((v) => !coveredVariants.has(v));
+    if (missing.length > 0) {
+      throw new EvalError(
+        `non-exhaustive match on ${family.typeName}: missing variant${missing.length === 1 ? "" : "s"} ${missing.join(", ")}`,
+        { code: "E-MATCH-NON-EXHAUSTIVE" },
+      );
+    }
+  }
+
+  const nonTailCtx: EvalContext = ctx.tail ? { ...ctx, tail: false } : ctx;
+  let target = yield { call: evaluate(targetExpr, nonTailCtx) };
+  if (is_promise(target)) {
+    target = yield target;
+  }
+
+  const onResolve = controlFlowResolve(target);
+  const inTail = ctx.tail === true;
+
+  for (const clause of parsedClauses) {
+    if (clause.kind === "catch-all") {
+      if (clause.bindVar !== null) {
+        const matchResolver = ctxResolver(ctx).child("match", "match") as LexicalScopeWithInternals<Resolver>;
+        matchResolver.env.bind(clause.bindVar, target);
+        return yield { call: evalBegin(clause.body, { ...ctx, resolver: matchResolver }), tail: inTail, onResolve };
+      }
+      return yield { call: evalBegin(clause.body, ctx), tail: inTail, onResolve };
+    }
+
+    if (target instanceof ADict) {
+      const k = target.get("kind");
+      let matches = false;
+      if (k instanceof ASymbol) {
+        const kn = symbol_name(k);
+        matches = kn === `:${clause.tag}` || kn === clause.tag;
+      } else if (k instanceof AString) {
+        matches = k.valueOf() === clause.tag;
+      }
+      if (matches) {
+        const matchResolver = ctxResolver(ctx).child("match", "match") as LexicalScopeWithInternals<Resolver>;
+        const fieldNames = clause.fields ?? target.keys().filter((key) => key !== "kind");
+        for (let i = 0; i < clause.patVars.length; i++) {
+          const pv = clause.patVars[i];
+          if (symbol_name(pv) === "_") continue;
+          const fieldKey = fieldNames[i];
+          let fv: SchemeValue = fieldKey !== undefined ? (target.get(fieldKey) as SchemeValue) : nil;
+          if (is_promise(fv)) {
+            fv = yield fv;
+          }
+          matchResolver.env.bind(pv, restrictControlFlowProvenance(target, fv));
+        }
+        return yield { call: evalBegin(clause.body, { ...ctx, resolver: matchResolver }), tail: inTail, onResolve };
+      }
+    }
+  }
+
+  throw new EvalError(`match: value ${String(target)} did not match any clause`, {
+    code: "E-MATCH-NO-CLAUSE",
+  });
+}
+
+// ============================================================================
 // Core Evaluator
 // ============================================================================
 
@@ -2357,6 +2671,7 @@ const SPECIAL_FORMS: Record<string, (rest: SchemeValue, ctx: EvalContext) => Eva
   quasiquote: evalQuasiquote,
   define: evalDefine,
   "define-macro": evalDefineMacro,
+  "define-variant": evalDefineVariant,
   lambda: evalLambda,
   let: evalLet,
   "let*": evalLetStar,
@@ -2366,6 +2681,7 @@ const SPECIAL_FORMS: Record<string, (rest: SchemeValue, ctx: EvalContext) => Eva
   or: evalOr,
   cond: evalCond,
   case: evalCase,
+  match: evalMatch,
   when: evalWhen,
   unless: evalUnless,
   do: evalDo,

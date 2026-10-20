@@ -37,6 +37,7 @@ import {
   type BakeRuntimeOpts,
   collectKwargsObject,
   contractMayCarryCallable,
+  splitAtFirstKeyword,
   type CrossingContract,
   type Impl,
   isSingleOutput,
@@ -68,9 +69,9 @@ function dynamicCallableDoorMessage(symbolName: string, position: string): strin
  *  Shallow only — containers (`z.list(z.dynamic)`) are the recursion gap; a container with a
  *  real element codec unwraps at its own decode. `undefined` when none (zero cost). */
 type DynamicSlotPositions =
-  | { readonly kind: "kwargs"; readonly keys: readonly string[] }
+  | { readonly kind: "kwargs"; readonly keys: readonly string[]; readonly indices: readonly number[] }
   | { readonly kind: "all-positional" }
-  | { readonly kind: "indices"; readonly indices: readonly number[] };
+  | { readonly kind: "indices"; readonly indices: readonly number[]; readonly restFrom?: number };
 
 function dynamicSlotPositions(
   inSchema: z.ZodTypeAny,
@@ -80,16 +81,27 @@ function dynamicSlotPositions(
     const keys = Object.entries(kwargsShape)
       .filter(([, slot]) => z.lookupName(slot) === "dynamic")
       .map(([key]) => key);
-    return keys.length === 0 ? undefined : { kind: "kwargs", keys };
+    const items = topLevelSchemas(inSchema);
+    const indices =
+      items === undefined || items.length === 0
+        ? []
+        : items.flatMap((item, i) => (z.lookupName(item) === "dynamic" ? [i] : []));
+    if (keys.length === 0 && indices.length === 0) return undefined;
+    if (keys.length === 0) return { kind: "indices", indices };
+    return { kind: "kwargs", keys, indices };
   }
   const items = topLevelSchemas(inSchema);
   if (items === undefined) return undefined;
+  const def = z.defOf(inSchema) as { type?: string; rest?: z.ZodTypeAny | null } | undefined;
   // Homogeneous array: topLevelSchemas is one item standing for every position.
-  if (items.length === 1) {
+  if (def?.type !== "tuple" && items.length === 1) {
     return z.lookupName(items[0]) === "dynamic" ? { kind: "all-positional" } : undefined;
   }
   const indices = items.flatMap((item, i) => (z.lookupName(item) === "dynamic" ? [i] : []));
-  return indices.length === 0 ? undefined : { kind: "indices", indices };
+  const restIsDynamic = def?.type === "tuple" && def.rest != null && z.lookupName(def.rest) === "dynamic";
+  if (indices.length === 0 && !restIsDynamic) return undefined;
+  if (restIsDynamic && indices.length === items.length) return { kind: "all-positional" };
+  return { kind: "indices", indices, ...(restIsDynamic ? { restFrom: items.length } : {}) };
 }
 
 /** Runtime closure: ban bare callables at z.dynamic positions. One invariant per family. */
@@ -101,7 +113,17 @@ function buildDynamicSlotCheck(
   switch (positions.kind) {
     case "kwargs":
       return (decodedArgs) => {
-        const obj = decodedArgs[0] as Record<string, unknown>;
+        if (positions.indices.length > 0) {
+          invariant(
+            positions.indices.every((i) => !isBareCallable(decodedArgs[i])),
+            () => {
+              const bad = positions.indices.filter((i) => isBareCallable(decodedArgs[i])).map((i) => i + 1);
+              const position = bad.length === 1 ? `argument ${bad[0]}` : `arguments ${bad.join(", ")}`;
+              return dynamicCallableDoorMessage(symbolName, position);
+            },
+          );
+        }
+        const obj = decodedArgs[decodedArgs.length - 1] as Record<string, unknown>;
         invariant(
           positions.keys.every((key) => !isBareCallable(obj[key])),
           () => {
@@ -125,17 +147,20 @@ function buildDynamicSlotCheck(
           },
         );
       };
-    case "indices":
+    case "indices": {
+      const { indices, restFrom } = positions;
+      const isDynIndex = (i: number): boolean => indices.includes(i) || (restFrom !== undefined && i >= restFrom);
       return (decodedArgs) => {
-        invariant(
-          positions.indices.every((i) => !isBareCallable(decodedArgs[i])),
-          () => {
-            const bad = positions.indices.filter((i) => isBareCallable(decodedArgs[i])).map((i) => i + 1);
-            const position = bad.length === 1 ? `argument ${bad[0]}` : `arguments ${bad.join(", ")}`;
-            return dynamicCallableDoorMessage(symbolName, position);
-          },
-        );
+        const ok =
+          indices.every((i) => !isBareCallable(decodedArgs[i])) &&
+          (restFrom === undefined || decodedArgs.slice(restFrom).every((a) => !isBareCallable(a)));
+        invariant(ok, () => {
+          const bad = decodedArgs.flatMap((a, i) => (isDynIndex(i) && isBareCallable(a) ? [i + 1] : []));
+          const position = bad.length === 1 ? `argument ${bad[0]}` : `arguments ${bad.join(", ")}`;
+          return dynamicCallableDoorMessage(symbolName, position);
+        });
       };
+    }
   }
 }
 
@@ -148,19 +173,27 @@ function buildOpaqueHandleUnwrap(
   const unwrap = (v: unknown): unknown => (v instanceof AOpaqueHandle ? v.instance : v);
   switch (positions.kind) {
     case "kwargs": {
-      const { keys } = positions;
+      const { keys, indices } = positions;
+      const idx = indices.length > 0 ? new Set(indices) : undefined;
       return (decodedArgs) => {
-        const obj = decodedArgs[0] as Record<string, unknown>;
+        const last = decodedArgs.length - 1;
+        const obj = decodedArgs[last] as Record<string, unknown>;
         const next: Record<string, unknown> = { ...obj };
         for (const key of keys) next[key] = unwrap(obj[key]);
-        return [next];
+        if (last === 0) return [next];
+        const head = idx
+          ? decodedArgs.slice(0, last).map((a, i) => (idx.has(i) ? unwrap(a) : a))
+          : decodedArgs.slice(0, last);
+        return [...head, next];
       };
     }
     case "all-positional":
       return (decodedArgs) => decodedArgs.map(unwrap);
     case "indices": {
       const idx = new Set(positions.indices);
-      return (decodedArgs) => decodedArgs.map((a, i) => (idx.has(i) ? unwrap(a) : a));
+      const { restFrom } = positions;
+      return (decodedArgs) =>
+        decodedArgs.map((a, i) => (idx.has(i) || (restFrom !== undefined && i >= restFrom) ? unwrap(a) : a));
     }
   }
 }
@@ -198,6 +231,9 @@ export function rosetta(tpl: TemplateStringsArray, ...sub: (string | number)[]) 
     const inSchema = normalizeInputVector(contract.input, contract.inputRest);
     const outSchema = normalizeVector(contract.output);
     const singleOut = isSingleOutput(contract.output);
+    const bakedInputRest: RestSpec = contract.inputRest;
+    const kwargsShape =
+      bakedInputRest !== undefined && !(bakedInputRest instanceof ZodType) ? bakedInputRest : undefined;
     // `dynamic` OUTPUT = no-transform escape hatch: skip z.encode so raw JS returns survive
     // (jsToScheme boxes after). `instance(Ctor)` is a real codec with its own encode — not here.
     const escapeSlots: readonly boolean[] = Array.isArray(contract.output)
@@ -215,6 +251,7 @@ export function rosetta(tpl: TemplateStringsArray, ...sub: (string | number)[]) 
     const callbackRoles = assertContractAxes(name, "rosetta", {
       inSchema,
       outSchema,
+      kwargsShape,
       provenance,
       cacheClass,
       declaredCallbackRoles: contract.callbackRoles,
@@ -229,11 +266,7 @@ export function rosetta(tpl: TemplateStringsArray, ...sub: (string | number)[]) 
     const rawImpl = impl as (...args: unknown[]) => unknown;
 
     // Region-scope gate: true only when input may hand the impl a live callable.
-    const carriesCallable = contractMayCarryCallable(inSchema);
-
-    const bakedInputRest: RestSpec = contract.inputRest;
-    const kwargsShape =
-      bakedInputRest !== undefined && !(bakedInputRest instanceof ZodType) ? bakedInputRest : undefined;
+    const carriesCallable = contractMayCarryCallable(inSchema, kwargsShape);
 
     const dynSlots = dynamicSlotPositions(inSchema, kwargsShape);
     const checkDynamicSlots = buildDynamicSlotCheck(name, dynSlots);
@@ -247,6 +280,7 @@ export function rosetta(tpl: TemplateStringsArray, ...sub: (string | number)[]) 
         name,
         doc,
         in: inSchema,
+        inputRest: bakedInputRest,
         out: outSchema,
         impl,
         provenance,
@@ -271,6 +305,7 @@ export function rosetta(tpl: TemplateStringsArray, ...sub: (string | number)[]) 
         hostImpl: rawImpl as (this: CallCtx, ...args: unknown[]) => unknown,
         carriesCallable,
         kwargsShape,
+        foldTrailingKeywords: bakedInputRest === undefined,
         checkDynamicSlots,
         unwrapOpaqueHandles,
         singleOut,
@@ -301,18 +336,39 @@ _installRosettaMembraneApply(async (proc, args, callCtx) => {
   try {
     const decode = (): readonly unknown[] => {
       if (m.kwargsShape) {
-        const decoded = decodeKwargsStrict(name, m.kwargsShape, collectKwargsObject(args));
-        const dropped = drainDroppedKwargNotes(decoded);
-        if (dropped !== undefined) {
-          const sink = callCtx.runCtx.notes;
-          for (const line of dropped) sink?.push(`${name}: ${line}`);
+        const decodeKw = (raw: Record<string, unknown>): unknown => {
+          const decoded = decodeKwargsStrict(name, m.kwargsShape!, raw);
+          const dropped = drainDroppedKwargNotes(decoded);
+          if (dropped !== undefined) {
+            const sink = callCtx.runCtx.notes;
+            for (const line of dropped) sink?.push(`${name}: ${line}`);
+          }
+          return decoded;
+        };
+        const items = topLevelSchemas(m.inSchema);
+        if (items === undefined || items.length === 0) {
+          return [decodeKw(collectKwargsObject(args))];
         }
-        return [decoded];
+        const { head, kwArgs } = splitAtFirstKeyword(args);
+        let decodedHead: unknown[];
+        try {
+          decodedHead = [...(z.decode(m.inSchema, head) as readonly unknown[])];
+        } catch (error) {
+          if (error instanceof ZodError) throw new Error(formatPositionalRejection(name, error, head, m.inSchema));
+          throw error;
+        }
+        while (decodedHead.length < items.length) decodedHead.push(undefined);
+        return [...decodedHead, decodeKw(collectKwargsObject(kwArgs))];
       }
+      let sent: readonly unknown[] = args;
       try {
-        return z.decode(m.inSchema, args) as readonly unknown[];
+        if (m.foldTrailingKeywords) {
+          const { head, kwArgs } = splitAtFirstKeyword(args);
+          if (kwArgs.length > 0) sent = [...head, collectKwargsObject(kwArgs)];
+        }
+        return z.decode(m.inSchema, sent) as readonly unknown[];
       } catch (error) {
-        if (error instanceof ZodError) throw new Error(formatPositionalRejection(name, error, args, m.inSchema));
+        if (error instanceof ZodError) throw new Error(formatPositionalRejection(name, error, sent, m.inSchema));
         throw error;
       }
     };

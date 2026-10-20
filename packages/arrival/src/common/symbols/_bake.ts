@@ -1,7 +1,7 @@
 // _bake: shared machinery behind the `symbol.*` factories — contract/decoded-type layer,
 // baked AEntity union, and helpers each per-tag factory (./native.ts, ./rosetta.ts, …)
 // builds from. Factories live one-per-file, re-assembled into `symbol` by ./index.ts;
-// package entry is `src/symbol/index.ts` (`@inhuman.tools/arrival`). Acyclic: factories
+// package entry is `src/symbol/index.ts` (`@here.build/arrival`). Acyclic: factories
 // import from here; nothing imports back through the namespace.
 //
 // docs/environments.md §CONTRACT — one zod contract, four readers (runtime validation,
@@ -138,9 +138,14 @@ export type DecodedArgsWithRest<
       : never
     : never
   : Rest extends Record<string, z.ZodTypeAny>
-    ? // kwargs: ONE trailing object param (face-projected fields), not a spread.
-      // Mirrors runtime `[z.decode(z.object(inputRest), fold(args))]`. `I` is `[]` at kwargs sites.
-      [{ [K in keyof Rest]: ProjectFace<Rest[K] & z.ZodTypeAny, F> }]
+    ? I extends readonly z.ZodTypeAny[]
+      ? SpecInfer<I, F> extends infer Head extends readonly ("js" extends F ? unknown : AValue)[]
+        ? // kwargs: ONE trailing object after the positional head. Empty `input` ⇒ `[kwargs]`
+          // (the whole call is the object). Nonempty ⇒ `[...Head, kwargs]`. Same walk as
+          // type-layer `emitCallArgs`: `(f x :a 1)` → `f(x, { a: 1 })`.
+          [...Head, { [K in keyof Rest]: ProjectFace<Rest[K] & z.ZodTypeAny, F> }]
+        : never
+      : never
     : DecodedArgs<I, F>;
 
 /** Declared-role vocabulary (P7: data in string key space; class/def is representation authority).
@@ -357,6 +362,7 @@ export interface RosettaSymbolDef<
   readonly name: string;
   readonly doc?: string;
   readonly in: I;
+  readonly inputRest?: RestSpec;
   readonly out: O;
   /** Authored JS impl (decoded args → result). Harvest/inspection only — apply spine lives
    *  on ARosettaProcedure's `arrival/tagless-final/apply`. */
@@ -494,6 +500,7 @@ export interface DefineSymbolDef {
   readonly name: string;
   readonly doc?: string;
   readonly in: z.ZodTypeAny;
+  readonly inputRest?: RestSpec;
   readonly out: z.ZodTypeAny;
   /** Spine adoption from AUTHORED slots (normalized `in` lost per-slot identity).
    *  Applied before body runs — body walks a real spine, not a borrowed vector. */
@@ -597,6 +604,26 @@ export function collectKwargsObject(args: readonly unknown[]): Record<string, un
   return obj;
 }
 
+/** A self-evaluating `:key` / `#:key` — the same cut `emitCallArgs` uses.
+ *  Name is `__name__` (ASymbol / AKeywordSymbol across isolates); strings (`AString`
+ *  or raw `string` like `":8080"`) have no `__name__` and must stay positional data. */
+export function isKwargKeyword(arg: unknown): boolean {
+  if (arg === null || typeof arg !== "object") return false;
+  const name = (arg as { __name__?: unknown }).__name__;
+  return typeof name === "string" && name.length > 1 && name.startsWith(":") && !name.startsWith("::");
+}
+
+/** Split `(tool a b :k v …)` at the first keyword. Leading non-keywords are the positional
+ *  head; the rest is interleaved kwargs (possibly empty). */
+export function splitAtFirstKeyword(args: readonly unknown[]): {
+  readonly head: readonly unknown[];
+  readonly kwArgs: readonly unknown[];
+} {
+  const cut = args.findIndex((arg) => isKwargKeyword(arg));
+  if (cut === -1) return { head: args, kwArgs: [] };
+  return { head: args.slice(0, cut), kwArgs: args.slice(cut) };
+}
+
 /** VectorSpec → one VectorSchema: bare tuple → `z.tuple`; array-ish schema → itself.
  *  Kwargs never reach here (`input: []` + plain-record `inputRest` → `normalizeInputVector`). */
 export function normalizeVector(spec: VectorSpec): VectorSchema {
@@ -617,7 +644,15 @@ function isSchemaTuple(spec: VectorSpec): spec is readonly z.ZodTypeAny[] {
 export function normalizeInputVector(input: VectorSpec, inputRest: RestSpec): VectorSchema {
   if (inputRest === undefined) return normalizeVector(input);
   // kwargs: container is not ZodType — instanceof is the discriminator.
-  if (!(inputRest instanceof ZodType)) return z.object(inputRest) as unknown as VectorSchema;
+  if (!(inputRest instanceof ZodType)) {
+    if (!isSchemaTuple(input)) {
+      throw new KeywordPairingError("input-rest-needs-tuple");
+    }
+    // Empty input: the whole call is the kwargs object (inSchema stays the object).
+    // Nonempty: inSchema is the positional tuple; kwargsShape lives on the membrane.
+    if (input.length === 0) return z.object(inputRest) as unknown as VectorSchema;
+    return normalizeVector(input);
+  }
   if (!isSchemaTuple(input)) {
     throw new KeywordPairingError("input-rest-needs-tuple");
   }
@@ -651,6 +686,7 @@ export function assertProvenanceRoleShape(
   role: ProvenanceRole,
   inSchema: z.ZodTypeAny,
   outSchema: z.ZodTypeAny,
+  kwargsShape?: Record<string, z.ZodTypeAny>,
 ): void {
   if (role === "sink" || role === "transparent") {
     const items = topLevelSchemas(outSchema);
@@ -667,9 +703,8 @@ export function assertProvenanceRoleShape(
     }
   }
   if (role === "fan") {
-    const items = topLevelSchemas(inSchema);
-    const hasLambda =
-      items === undefined ? z.lookupName(inSchema) === "lambda" : items.some((item) => z.lookupName(item) === "lambda");
+    const slots = cacheGateSlots(inSchema, kwargsShape);
+    const hasLambda = slots.some((slot) => z.lookupName(slot) === "lambda");
     if (!hasLambda) {
       throw new ProvenanceRoleShapeError(
         name,
@@ -680,13 +715,21 @@ export function assertProvenanceRoleShape(
   }
 }
 
-/** Cache-gate slots: topLevelSchemas + kwargs object fields + bare fallback. */
-function cacheGateSlots(schema: z.ZodTypeAny): readonly z.ZodTypeAny[] {
+/** Cache-gate slots: topLevelSchemas (plus tuple rest) + kwargs object fields + bare fallback. */
+function cacheGateSlots(
+  schema: z.ZodTypeAny,
+  kwargsShape?: Record<string, z.ZodTypeAny>,
+): readonly z.ZodTypeAny[] {
+  const extra = kwargsShape === undefined ? [] : Object.values(kwargsShape);
   const items = topLevelSchemas(schema);
-  if (items !== undefined) return items;
+  if (items !== undefined) {
+    const def = z.defOf(schema) as { type?: string; rest?: z.ZodTypeAny | null } | undefined;
+    const withRest = def?.type === "tuple" && def.rest != null ? [...items, def.rest] : items;
+    return extra.length === 0 ? withRest : [...withRest, ...extra];
+  }
   const def = z.defOf(schema) as { type?: string; shape?: Record<string, z.ZodTypeAny> } | undefined;
   if (def?.type === "object" && def.shape) return Object.values(def.shape);
-  return [schema];
+  return extra.length === 0 ? [schema] : [schema, ...extra];
 }
 
 /** REGION-SCOPE GATE: does normalized INPUT carry a live-callable slot?
@@ -698,8 +741,11 @@ function cacheGateSlots(schema: z.ZodTypeAny): readonly z.ZodTypeAny[] {
  *    reopens the hole. Err toward scoping.
  *  INPUT only: scheme→JS reverse calls need the gate; JS→scheme encode has no region concern.
  *  Rosetta uses this once at bake — lambda-free verbs pay zero. docs/membrane.md §REGION. */
-export function contractMayCarryCallable(inSchema: z.ZodTypeAny): boolean {
-  return cacheGateSlots(inSchema).some((slot) => {
+export function contractMayCarryCallable(
+  inSchema: z.ZodTypeAny,
+  kwargsShape?: Record<string, z.ZodTypeAny>,
+): boolean {
+  return cacheGateSlots(inSchema, kwargsShape).some((slot) => {
     const slotName = z.lookupName(slot);
     return slotName === "procedure" || slotName === "dynamic";
   });
@@ -718,13 +764,14 @@ export function assertSlotKinds(
   kind: "rosetta" | "native" | "sequence" | "define",
   inSchema: z.ZodTypeAny,
   outSchema: z.ZodTypeAny,
+  kwargsShape?: Record<string, z.ZodTypeAny>,
 ): void {
   const banned: readonly string[] = kind === "rosetta" ? ["schemeValue"] : ["dynamic", "instance"];
-  for (const [side, schema] of [
-    ["input", inSchema],
-    ["output", outSchema],
+  for (const [side, slots] of [
+    ["input", cacheGateSlots(inSchema, kwargsShape)],
+    ["output", cacheGateSlots(outSchema)],
   ] as const) {
-    for (const slot of cacheGateSlots(schema)) {
+    for (const slot of slots) {
       const slotName = z.lookupName(slot);
       if (slotName !== undefined && banned.includes(slotName)) {
         throw new ContractSlotKindError(name, kind, side, slotName);
@@ -741,13 +788,14 @@ export function assertCacheClassShape(
   cacheClass: CacheClass | undefined,
   inSchema: z.ZodTypeAny,
   outSchema: z.ZodTypeAny,
+  kwargsShape?: Record<string, z.ZodTypeAny>,
 ): void {
   if (cacheClass !== "view") return; // pure / absent: regenerateable — no gate
-  for (const [side, schema] of [
-    ["input", inSchema],
-    ["output", outSchema],
+  for (const [side, slots] of [
+    ["input", cacheGateSlots(inSchema, kwargsShape)],
+    ["output", cacheGateSlots(outSchema)],
   ] as const) {
-    for (const slot of cacheGateSlots(schema)) {
+    for (const slot of slots) {
       const slotName = z.lookupName(slot);
       if (slotName === "lambda") {
         throw new CacheClassShapeError(
@@ -780,13 +828,14 @@ export function assertResourcePathContractShape(
   queries: ResourcePathFn | undefined,
   inSchema: z.ZodTypeAny,
   outSchema: z.ZodTypeAny,
+  kwargsShape?: Record<string, z.ZodTypeAny>,
 ): void {
   if (queries === undefined) return;
-  for (const [side, schema] of [
-    ["input", inSchema],
-    ["output", outSchema],
+  for (const [side, slots] of [
+    ["input", cacheGateSlots(inSchema, kwargsShape)],
+    ["output", cacheGateSlots(outSchema)],
   ] as const) {
-    for (const slot of cacheGateSlots(schema)) {
+    for (const slot of slots) {
       const slotName = z.lookupName(slot);
       if (slotName === "lambda" || slotName === "schemeValue" || slotName === "dynamic") {
         throw new ResourcePathShapeError(name, side, slotName);
@@ -834,8 +883,9 @@ export function extractCallbackRoles(
   inSchema: z.ZodTypeAny,
   outSchema: z.ZodTypeAny,
   declared: readonly CallbackRole[] | undefined,
+  kwargsShape?: Record<string, z.ZodTypeAny>,
 ): CallbackRoles | undefined {
-  const inItems = topLevelSchemas(inSchema) ?? [];
+  const inItems = cacheGateSlots(inSchema, kwargsShape);
   // lookupName walks .optional() — z.lambda.optional() still counts.
   const lambdaCount = inItems.filter((item) => z.lookupName(item) === "lambda").length;
   if (declared !== undefined && declared.length > lambdaCount) {
@@ -880,6 +930,7 @@ export type ContractAxesKind = "rosetta" | "native" | "sequence" | "define";
 export interface ContractAxesOpts {
   readonly inSchema: z.ZodTypeAny;
   readonly outSchema: z.ZodTypeAny;
+  readonly kwargsShape?: Record<string, z.ZodTypeAny>;
   readonly provenance?: ProvenanceRole;
   readonly cacheClass?: CacheClass;
   readonly declaredCallbackRoles?: readonly CallbackRole[];
@@ -913,25 +964,32 @@ export function assertContractAxes(
   kind: ContractAxesKind,
   opts: ContractAxesOpts,
 ): CallbackRoles | undefined {
-  const { inSchema, outSchema } = opts;
+  const { inSchema, outSchema, kwargsShape } = opts;
   if (kind === "define") {
-    assertSlotKinds(name, kind, inSchema, outSchema);
+    assertSlotKinds(name, kind, inSchema, outSchema, kwargsShape);
     return undefined;
   }
   const provenance = opts.provenance!; // rosetta/native/sequence always resolve one before baking
   if (kind === "rosetta") {
-    assertProvenanceRoleShape(name, provenance, inSchema, outSchema);
-    assertCacheClassShape(name, opts.cacheClass, inSchema, outSchema);
-    const callbackRoles = extractCallbackRoles(name, provenance, inSchema, outSchema, opts.declaredCallbackRoles);
+    assertProvenanceRoleShape(name, provenance, inSchema, outSchema, kwargsShape);
+    assertCacheClassShape(name, opts.cacheClass, inSchema, outSchema, kwargsShape);
+    const callbackRoles = extractCallbackRoles(
+      name,
+      provenance,
+      inSchema,
+      outSchema,
+      opts.declaredCallbackRoles,
+      kwargsShape,
+    );
     assertResourcePathRoles(name, provenance, opts.queries, opts.effects, outSchema);
-    assertResourcePathContractShape(name, opts.queries, inSchema, outSchema);
-    assertSlotKinds(name, kind, inSchema, outSchema);
+    assertResourcePathContractShape(name, opts.queries, inSchema, outSchema, kwargsShape);
+    assertSlotKinds(name, kind, inSchema, outSchema, kwargsShape);
     return callbackRoles;
   }
-  assertSlotKinds(name, kind, inSchema, outSchema);
-  assertProvenanceRoleShape(name, provenance, inSchema, outSchema);
-  assertCacheClassShape(name, opts.cacheClass, inSchema, outSchema);
-  return extractCallbackRoles(name, provenance, inSchema, outSchema, opts.declaredCallbackRoles);
+  assertSlotKinds(name, kind, inSchema, outSchema, kwargsShape);
+  assertProvenanceRoleShape(name, provenance, inSchema, outSchema, kwargsShape);
+  assertCacheClassShape(name, opts.cacheClass, inSchema, outSchema, kwargsShape);
+  return extractCallbackRoles(name, provenance, inSchema, outSchema, opts.declaredCallbackRoles, kwargsShape);
 }
 
 // Declaration channels for contract-less kinds (tagless/tagless-guard). The contract is

@@ -129,6 +129,24 @@ export function definitionOf(form: unknown): { readonly name: string; readonly h
   return null;
 }
 
+/** Names bound by a `(define-variant <type-spec> (<VariantName> ...) ...)` form:
+ *  each variant binds `VariantName` (constructor) and `VariantName?` (predicate). */
+export function variantDefinitionsOf(form: unknown): string[] {
+  if (!(form instanceof APair) || !(form.car instanceof ASymbol)) return [];
+  if (nameOf(form.car) !== "define-variant") return [];
+  if (!(form.cdr instanceof APair)) return [];
+  const out: string[] = [];
+  for (const clause of chainOf(form.cdr.cdr)) {
+    if (clause instanceof APair && clause.car instanceof ASymbol) {
+      const vn = nameOf(clause.car);
+      if (vn !== null) {
+        out.push(vn, `${vn}?`);
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * Every lexically-free symbol occurrence of `form`, in first-encounter (program)
  * order, each with the innermost enclosing located Pair's span. Bound occurrences
@@ -154,6 +172,7 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
     for (const f of forms) {
       const def = definitionOf(f);
       if (def !== null) names.push(def.name);
+      for (const vn of variantDefinitionsOf(f)) names.push(vn);
     }
     const inner = names.length === 0 ? bound : new Set([...bound, ...names]);
     for (const f of forms) walk(f, inner, span);
@@ -298,10 +317,39 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
           }
           case "define-macro":
           case "define-syntax":
+          case "define-variant":
             // A macro body's "free variables" name the EXPANSION env —
-            // categorically outside this pass. The bound NAME is collected by the
-            // first sweep / body pre-pass; the interior contributes nothing.
+            // categorically outside this pass. `define-variant` type/field specs are
+            // structural declarations, not expression references; bound constructor/predicate
+            // names are collected by the first sweep / body pre-pass.
             return;
+          case "match": {
+            // (match expr ((VariantName patVar…) body…) …)
+            if (!(n.cdr instanceof APair)) return;
+            walk(n.cdr.car, bound, loc);
+            for (const clause of chainOf(n.cdr.cdr)) {
+              if (!(clause instanceof APair)) continue;
+              const pat = clause.car;
+              if (pat instanceof APair) {
+                const patParts = chainOf(pat);
+                const patVars: string[] = [];
+                for (const p of patParts.slice(1)) {
+                  if (p instanceof ASymbol) {
+                    const pn = nameOf(p);
+                    if (pn !== null && pn !== "_") patVars.push(pn);
+                  }
+                }
+                walkBody(clause.cdr, new Set([...bound, ...patVars]), loc);
+              } else if (pat instanceof ASymbol) {
+                const pn = nameOf(pat);
+                const inner = pn !== null && pn !== "else" && pn !== "_" ? new Set([...bound, pn]) : bound;
+                walkBody(clause.cdr, inner, loc);
+              } else {
+                walkBody(clause.cdr, bound, loc);
+              }
+            }
+            return;
+          }
           case "try": {
             // (try body (catch (var) handler…) [(finally expr…)]) — evalTry's exact
             // shape (evaluator.ts): ONE body form, then clauses. `catch`/`finally`

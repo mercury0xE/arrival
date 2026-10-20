@@ -137,7 +137,7 @@ users.filter{(u) => u[:age] < 30}
 
 The lens never renames _your_ parameters — `u` stays `u`. When you want `it`-ification
 (or `items` → `item` recovery), that's the explicit opt-in `tidyBoundNames` pass from
-`@inhuman.tools/arrival-sugarcoat/names`, or its no-touch twin `boundNameHints` for editor
+`@here.build/arrival-sugarcoat/names`, or its no-touch twin `boundNameHints` for editor
 inlays.
 
 `=>` is just an alias of `lambda` — `(=> (y) y)` is legal — but `{(y) => y}` is the face.
@@ -193,18 +193,18 @@ cond
 ;; ≡ (cond ((< n 0) "neg") ((= n 0) "zero") (else "pos"))
 ```
 
-## Dicts, lists, and kwargs
+## Dicts, vectors, and kwargs
 
 `{}` and `[]` are collection literals on the sugarcoat surface (same glyphs as arrival's
-reader). They fold to `(dict …)` / `(list …)`:
+reader). They fold to `(dict …)` / `(vector …)`:
 
 ```scheme
 {:name "Ada" :age 36}     ;; ≡ (dict :name "Ada" :age 36)
 {}                        ;; ≡ (dict)
-[1 2 3]                   ;; ≡ (list 1 2 3)
-[]                        ;; ≡ (list)
-[{:a 1} {:b 2}]           ;; ≡ (list (dict :a 1) (dict :b 2))
-[a b]                     ;; ≡ (list a b)  — also from (cons a b); save normalizes to list
+[1 2 3]                   ;; ≡ (vector 1 2 3)
+[]                        ;; ≡ (vector)
+[{:a 1} {:b 2}]           ;; ≡ (vector (dict :a 1) (dict :b 2))
+(list 1 2 3)              ;; lists stay prefix — [] is a vector, not a list
 ```
 
 **`{}` is shared with n-expr.** Discrimination is odd/even at the top level:
@@ -223,12 +223,16 @@ reader). They fold to `(dict …)` / `(list …)`:
 
 Suffix keys flip inside braces: `{name: "Ada"}` ≡ `{:name "Ada"}`.
 
-**`[]` is free list only when not tight.** Tight postfix is still subscript access:
+**`[]` is a free vector only when not tight.** Tight postfix is still subscript access:
 
 ```scheme
-xs[0]                     ;; ≡ (car xs)         — tight subscript
-(f [1 2])                 ;; ≡ (f (list 1 2))   — spaced free list
+xs[0]                     ;; ≡ (car xs)            — tight subscript
+(f [1 2])                 ;; ≡ (f (vector 1 2))    — spaced free vector
 ```
+
+R7RS `#(1 2 3)` is the *constant* vector (elements do not evaluate). It is not a
+sugarcoat/syntax-forest datum: `#` is a word and `(` opens a list, so the lens
+splits them. Write `[…]` / `(vector …)` for the evaluating vector both faces share.
 
 Kwarg-taking heads other than `dict` (e.g. a `.prompt` require) still use the block
 colon-pair form under the head name. The legacy unbraced dict block still reads:
@@ -283,4 +287,4 @@ is the ancestor.
 
 That's the surface. The machinery behind it — the round-trip law, span alignment for
 editors (`alignSugarcoatScheme`), parameter hints, the `parseSexprs` forest
-(`@inhuman.tools/arrival-syntax`, re-exported here) — is in the [README](./README.md).
+(`@here.build/arrival-syntax`, re-exported here) — is in the [README](./README.md).

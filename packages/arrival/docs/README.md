@@ -20,9 +20,9 @@ Four things arrival does NOT have. Each is invisible in the code — a contribut
 them before touching any subsystem, because a change that reintroduces one breaks the machine
 at a level no local test names.
 
-- **No continuations.** `call/cc`/`dynamic-wind` are deliberately absent — the classical
-  region-escape channel, closed on purpose (`PRINCIPLES.md` P0; `PROVENANCE.md`
-  constitutional ground).
+- **No continuations.** `call/cc`/`dynamic-wind` are teaching-doored (`notImplemented` /
+  `PurityError`) — the classical region-escape channel, closed on purpose (`PRINCIPLES.md`
+  P0; `PROVENANCE.md` constitutional ground). They resolve in the env; applying them throws.
 - **No mutation.** Values are frozen at construction; the mutator family is teaching-doored.
   The only writes are two named doors — cycle knot-tying and phase-gated assembly binding
   that dies at phase close. Mutation is the classical isolation-escape channel (`PRINCIPLES.md`
@@ -46,9 +46,9 @@ directory name; names survive `git mv`, links rot.
 | Environments / assembly | `environments.md`            | `src/env/`, `src/common/`                                                                |
 | Membrane / FFI crossing | `membrane.md`                | `src/membrane/`                                                                          |
 | Execution / run model   | `execution.md`               | `src/run/`, `src/eval/`                                                                  |
-| Static-analysis plane   | `static-plane.md`            | `src/type-layer/`, `src/oracle/`, `src/static-validation/`, `@inhuman.tools/arrival-lsp` |
+| Static-analysis plane   | `static-plane.md`            | `src/type-layer/`, `src/oracle/`, `src/static-validation/`, `@here.build/arrival-lsp` |
 | Provenance              | `PROVENANCE.md`              | `src/provenance/`                                                                        |
-| Loader / modules        | `environments.md` §LOADER    | `@inhuman.tools/arrival-modules`                                                         |
+| Loader / modules        | `environments.md` §LOADER    | `@here.build/arrival-modules`                                                         |
 | Errors / doors          | `grammar.md` §ERRORS         | `src/errors.ts`                                                                          |
 | Capability authoring    | `writing-capabilities.md`    | — (how-to over `src/common/`, `src/membrane/`)                                           |
 | LLM agent card          | `llm-agent-card.md`          | — (system-prompt surface; custdev-measured)                                              |

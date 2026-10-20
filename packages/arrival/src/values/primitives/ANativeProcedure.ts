@@ -10,6 +10,7 @@ import type {
   DefineSymbolDef,
   MetadataRecord,
   ProvenanceRole,
+  RestSpec,
   SequenceSymbolDef,
   TaglessGuardSymbolDef,
   TaglessSymbolDef,
@@ -33,6 +34,7 @@ export interface NativeSymbolDef {
   readonly name: string;
   readonly doc?: string;
   readonly in: ZodTypeAny;
+  readonly inputRest?: RestSpec;
   readonly out: ZodTypeAny;
   readonly impl: AnyFn;
   /** See `Contract.type` (`_bake.ts`). */

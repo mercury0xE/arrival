@@ -26,9 +26,10 @@
 //        rosetta is implicitly ASYNC (bake awaits) → Promise<…>; native is sync.
 
 import { zodToTs, printNode, createAuxiliaryTypeStore, type OptionalTypeOverrideFunction } from "zod-to-ts";
+import { ZodType } from "zod";
 import * as z from "../common/scheme-zod/index.js";
 import { tagToJsonSchema } from "../common/schema-tag.js";
-import type { AEntity } from "../common/symbols/_bake.js";
+import type { AEntity, RestSpec } from "../common/symbols/_bake.js";
 
 // Scheme primitive → its PLAIN-TS IMAGE (Scheme is a TS subset; see carriers.ts).
 //
@@ -260,7 +261,7 @@ function paramName(i: number): string {
 /** The PARAMETER LIST from a normalized input schema. A z.tuple → "(a: A, b: B)"
  *  (its items, named positionally; empty → "()"); an array-ish schema → a variadic
  *  rest param "(...args: T[])". */
-function paramList(input: z.ZodTypeAny): string {
+function paramList(input: z.ZodTypeAny, inputRest?: RestSpec): string {
   const def = zodDef(input);
   if (def.type === "tuple") {
     const items = def.items ?? [];
@@ -270,6 +271,11 @@ function paramList(input: z.ZodTypeAny): string {
     // same "purely variadic" shape as the array-ish branch below, so it gets the same "args"
     // name; only a genuine fixed-head-plus-tail earns the "rest" name.
     if (def.rest != null) params.push(`...${items.length === 0 ? "args" : "rest"}: ${printType(def.rest)}[]`);
+    else if (items.length > 0 && inputRest !== undefined && !(inputRest instanceof ZodType)) {
+      const kwType = printType(z.object(inputRest));
+      const allOptional = Object.values(inputRest).every((s) => s.safeParse(undefined).success);
+      params.push(`${paramName(items.length)}${allOptional ? "?" : ""}: ${kwType}`);
+    }
     return `(${params.join(", ")})`;
   }
   if (def.type === "array" && def.element != null) {
@@ -328,7 +334,8 @@ export function signatureOf(def: AEntity): string {
     // arrow (`in`/`out` still normalize to the 0-ary-procedure convention, so
     // `paramList(def.in)` would print a spurious `()` param list for it).
     if (def.kind === "define" && !def.callable) return returnType(def.out);
-    const params = paramList(def.in);
+    const inputRest = "inputRest" in def ? def.inputRest : undefined;
+    const params = paramList(def.in, inputRest);
     const ret = returnType(def.out);
     // Only "rosetta" is a genuine JS-membrane crossing (async by construction); every
     // other kind — including "define", a scheme-face contour like "native"/"sequence"/
