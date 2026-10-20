@@ -48,6 +48,8 @@ export default EnvCapability.define("scheme/core", {
     do: symbol.keyword`do: iterate stepped bindings until the test clause is true`,
     while: symbol.keyword`while: iterate the body while the test evaluates truthy`,
     try: symbol.keyword`try: body with an optional catch/finally handler`,
+    "define-variant": symbol.keyword`define-variant: declare an algebraic data type with variant constructors and predicates`,
+    match: symbol.keyword`match: exhaustive structural pattern match over a variant value`,
     // Contract mirrors gensym's raw signature: the optional name hint is a raw symbol
     // NAME (string/symbol/number), an ASymbol, or null — never a boxed SchemeValue.
     // Output is the freshly-minted ASymbol. `type` pins the model-facing shape: an

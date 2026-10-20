@@ -81,6 +81,8 @@ export const KEYWORD_SYNTAX_BASELINE: ReadonlySet<string> = new Set([
   "do",
   "while",
   "try",
+  "define-variant",
+  "match",
 ]);
 
 // ── Parse + span-locate, memoized per def object ─────────────────────────────
