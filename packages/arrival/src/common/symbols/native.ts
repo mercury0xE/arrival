@@ -26,6 +26,7 @@ import {
   type VectorSpec,
 } from "./_bake.js";
 import { assertNoResourcePathProducers } from "../../run/resource-paths.js";
+import { releaseRunContext, retainRunContext } from "../../run/run-lifecycle.js";
 
 /** Native host fn over scheme values. Slot bans on ContourContract (`_bake.ts` §1.7). */
 function native(tpl: TemplateStringsArray, ...sub: unknown[]) {
@@ -64,6 +65,18 @@ function native(tpl: TemplateStringsArray, ...sub: unknown[]) {
           )
         : 0;
     const applyImpl = impl as (this: CallCtx, ...a: unknown[]) => unknown;
+    const callImpl = (callCtx: CallCtx, callArgs: unknown[]): unknown => {
+      const out = applyImpl.apply(callCtx, callArgs);
+      if (
+        out !== null &&
+        (typeof out === "object" || typeof out === "function") &&
+        typeof (out as { then?: unknown }).then === "function"
+      ) {
+        retainRunContext(callCtx.runCtx);
+        return Promise.resolve(out).finally(() => releaseRunContext(callCtx.runCtx));
+      }
+      return out;
+    };
     // Interpreter args are untyped SchemeValues; impl wants the contract tuple.
     // Passthrough (no list slot) is the same widening — adoption is the typed path.
     const hostImpl: (this: CallCtx, ...a: readonly SchemeValue[]) => unknown = function (
@@ -81,7 +94,7 @@ function native(tpl: TemplateStringsArray, ...sub: unknown[]) {
           return decoded;
         };
         if (items.length === 0) {
-          return applyImpl.apply(this, [decodeKw(collectKwargsObject(args))]);
+          return callImpl(this, [decodeKw(collectKwargsObject(args))]);
         }
         const { head, kwArgs } = splitAtFirstKeyword(args);
         if (head.length < minPositional || head.length > items.length) {
@@ -95,10 +108,10 @@ function native(tpl: TemplateStringsArray, ...sub: unknown[]) {
         const adopted = [...(adoptArgs === undefined ? head : adoptArgs(head as SchemeValue[]))];
         while (adopted.length < items.length) adopted.push(undefined);
         const kwargs = decodeKw(collectKwargsObject(kwArgs));
-        return applyImpl.apply(this, [...adopted, kwargs]);
+        return callImpl(this, [...adopted, kwargs]);
       }
       const adopted = adoptArgs === undefined ? args : adoptArgs(args);
-      return applyImpl.apply(this, adopted as unknown[]);
+      return callImpl(this, adopted as unknown[]);
     };
     return new ANativeProcedure({
       name,

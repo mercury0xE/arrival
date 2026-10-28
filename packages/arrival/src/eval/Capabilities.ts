@@ -37,18 +37,22 @@ export class Capabilities {
    * for it.
    */
   private readonly chain: CompiledResolutionChain | undefined;
+  private readonly preludeDefines: AmbientRuntime | undefined;
 
   /**
    * @param env  the base leaf this wraps (glass: the scope env; assembled: the base top).
    * @param chain  ASSEMBLED mode — the sealed resolution chain; `lookup`/`refFrame`
    *   consult it and `globalRoot` is the stable `env` sentinel. Absent (GLASS,
    *   default): the structural `chainRoot` probe over the live walk.
+   * @param preludeDefines  optional per-run prelude-define frame layered above `chain`.
    */
   constructor(
     readonly env: AmbientRuntime,
     chain?: CompiledResolutionChain,
+    preludeDefines?: AmbientRuntime,
   ) {
     this.chain = chain;
+    this.preludeDefines = preludeDefines;
   }
 
   /** The raw base bindings lookup (`undefined` on a miss, no synth) — the capability
@@ -57,7 +61,8 @@ export class Capabilities {
    *  reaches here on a hit). Assembled: ONE probe of the sealed chain — the degenerate
    *  zero-resolver form is a single flat `Map.get`. */
   lookup(name: string | symbol, ctx?: RunContext): AmbientValue | undefined {
-    return this.chain === undefined ? this.env._lookupWithResolvers(name, ctx) : this.chain.lookup(name, ctx);
+    if (this.chain === undefined) return this.env._lookupWithResolvers(name, ctx);
+    return this.preludeDefines?._lookupWithResolvers(name, ctx) ?? this.chain.lookup(name, ctx);
   }
 
   /** The base's enumerable VOCABULARY — assembled: the sealed chain's merged static
@@ -65,7 +70,9 @@ export class Capabilities {
    *  contract); glass: the live `__parent__`-chain enumeration. The typo-suggestion
    *  source for the Resolver's unbound-variable throw. */
   allBoundNames(): Iterable<string | symbol> {
-    return this.chain === undefined ? this.env.allBoundNames() : this.chain.names;
+    if (this.chain === undefined) return this.env.allBoundNames();
+    if (this.preludeDefines === undefined) return this.chain.names;
+    return [...new Set<string | symbol>([...this.preludeDefines.allBoundNames(), ...this.chain.names])];
   }
 
   /** The capability base = the chain root, found structurally as the
@@ -103,6 +110,7 @@ export class Capabilities {
       const root = this.chainRoot();
       return root.has(name) ? root : undefined;
     }
+    if (this.preludeDefines?.has(name)) return this.chain;
     return this.chain.lookup(name) === undefined ? undefined : this.chain;
   }
 

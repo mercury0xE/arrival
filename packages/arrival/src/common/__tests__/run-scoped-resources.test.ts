@@ -21,7 +21,8 @@ import { EnvCapability } from "../capability.js";
 import { symbol } from "../../symbol/index.js";
 import * as sz from "../scheme-zod/index.js";
 import { port, type Resource } from "../resources.js";
-import { execOverFrame } from "../../eval/generator-exec.js";
+import { exec, execOverFrame } from "../../eval/generator-exec.js";
+import { assembleExecRunContext } from "../../host-internals/index.js";
 import { applyCapability, freshEnv } from "../../__tests__/_fresh-env.js";
 import { RunContext } from "../../run/RunContext.js";
 import { disposeRunContext } from "../../run/run-lifecycle.js";
@@ -194,5 +195,131 @@ describe("Stage 2 — per-RunContext capability resources", () => {
       await disposeRunContext(sessionRunCtx);
       await disposeRunContext(otherRunCtx);
     });
+
+    it("(c) disposes resources acquired during a capability prelude if the prelude later throws", async () => {
+      const counts = { spawned: 0, disposed: 0 };
+      const cap = EnvCapability.define("test/prelude-throw-dispose", {
+        resources: () => {
+          counts.spawned += 1;
+          return {
+            touch: () => "ok",
+            [Symbol.asyncDispose]: async () => {
+              counts.disposed += 1;
+            },
+          };
+        },
+        prelude: '(begin (res/touch) (error "prelude boom"))',
+        symbols: (sym, sz) => ({
+          "res/touch": sym.rosetta`res/touch: touches run resource during prelude`(
+            { input: [], output: [sz.string] },
+            function () {
+              return this.resources.touch();
+            },
+          ),
+        }),
+      });
+
+      await expect(exec("(+ 1 2)", { capabilities: [cap] })).rejects.toThrow(/prelude boom/);
+      expect(counts.spawned).toBe(1);
+      expect(counts.disposed).toBe(1);
+    });
+
+    it("(d) defers resource teardown on abort until an in-flight async rosetta hostImpl settles", async () => {
+      let releaseHost!: () => void;
+      const hostGate = new Promise<void>((resolve) => {
+        releaseHost = resolve;
+      });
+      let notifyEntered!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        notifyEntered = resolve;
+      });
+
+      let isClosed = false;
+      let closedWhilePending = false;
+      let disposeCalls = 0;
+
+      const cap = EnvCapability.define("test/inflight-abort-defer", {
+        resources: () => ({
+          readClosed: () => isClosed,
+          [Symbol.asyncDispose]: async () => {
+            disposeCalls += 1;
+            isClosed = true;
+          },
+        }),
+        symbols: (sym, sz) => ({
+          "slow/op": sym.rosetta`slow/op: uncancelled async host operation`(
+            { input: [], output: [sz.string] },
+            async function () {
+              notifyEntered();
+              await hostGate;
+              if (this.resources.readClosed()) {
+                closedWhilePending = true;
+              }
+              return "done";
+            },
+          ),
+        }),
+      });
+
+      const controller = new AbortController();
+      const runPromise = exec("(slow/op)", { capabilities: [cap], signal: controller.signal });
+      await entered;
+      controller.abort(new Error("timed out"));
+
+      await expect(runPromise).rejects.toThrow(/timed out/);
+      // Resource must NOT be closed while slow/op is still pending.
+      expect(isClosed).toBe(false);
+      expect(disposeCalls).toBe(0);
+
+      releaseHost();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(closedWhilePending).toBe(false);
+      expect(isClosed).toBe(true);
+      expect(disposeCalls).toBe(1);
+    });
+
+    it("(e) assembleExecRunContext mints a caller-owned RunContext that shares resources across exec calls", async () => {
+      const { capability, counts } = spyDefined();
+      const runCtx = await assembleExecRunContext({ capabilities: [capability] });
+      await exec('(cache/put "shared" "yes")', { capabilities: [capability], runCtx });
+      const [val] = await exec('(cache/get "shared")', { capabilities: [capability], runCtx });
+      expect(val).toBe("yes");
+      expect(counts.spawned).toBe(1);
+      expect(counts.disposed).toBe(0);
+      await disposeRunContext(runCtx);
+      expect(counts.disposed).toBe(1);
+    });
+
+    it("(f) waits for all concurrent in-flight operations (inFlight === 2) and runs teardowns registered during drain even if one teardown throws", async () => {
+      const { retainRunContext, releaseRunContext, onRunContextDispose } = await import("../../run/run-lifecycle.js");
+      const runCtx = new RunContext({});
+      const events: string[] = [];
+
+      retainRunContext(runCtx);
+      retainRunContext(runCtx);
+      onRunContextDispose(runCtx, async () => {
+        events.push("teardown-1-throws");
+        throw new Error("teardown 1 boom");
+      });
+
+      await disposeRunContext(runCtx);
+      expect(events).toEqual([]);
+
+      // Registering a teardown while disposeRequested && !disposed (during in-flight drain) must still be accepted.
+      onRunContextDispose(runCtx, async () => {
+        events.push("teardown-2-late");
+      });
+
+      // First operation finishes (inFlight: 2 -> 1): teardowns must still wait.
+      await releaseRunContext(runCtx);
+      expect(events).toEqual([]);
+
+      // Second operation finishes (inFlight: 1 -> 0): both teardowns run once via Promise.allSettled.
+      await releaseRunContext(runCtx);
+      expect(events).toEqual(["teardown-1-throws", "teardown-2-late"]);
+    });
   });
 });
+
+

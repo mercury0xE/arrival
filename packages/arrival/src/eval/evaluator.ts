@@ -179,6 +179,8 @@ export interface EvalTap {
    * doesn't fire enter/exit — without this the resolved value never reaches the tap.
    */
   onSymbolResolved?(invocation: Invocation | null, symbol: ASymbol, value: SchemeValue): void;
+  /** Mark a control-flow-restricted provenance union as authoritative so enclosing forms forward it without re-unioning unchosen children. */
+  markAuthoritativeProvenance?<T extends ReadonlySet<number>>(set: T): T;
 }
 
 export interface EvalContext {
@@ -797,10 +799,11 @@ export default run;
  * env bindings. onSymbolResolved reads value.provenance directly, so the value
  * itself must carry union(pred, arm) before the binding fires.
  */
-function restrictControlFlowProvenance(predicate: SchemeValue, armResult: SchemeValue): SchemeValue {
+function restrictControlFlowProvenance(predicate: SchemeValue, armResult: SchemeValue, tap?: EvalTap): SchemeValue {
   if (!(armResult instanceof AValue)) return armResult;
   if (!(predicate instanceof AValue) || predicate.provenance.size === 0) return armResult;
   const prov = unionProvenance([predicate, armResult]);
+  tap?.markAuthoritativeProvenance?.(prov);
   // Same reference when only one distinct set contributed — no allocation.
   return prov === armResult.provenance ? armResult : armResult.withProvenance(prov);
 }
@@ -817,10 +820,10 @@ function restrictControlFlowProvenance(predicate: SchemeValue, armResult: Scheme
  * provenance-bearing predicates (rare in a tight loop) pay O(n) — accepted as
  * reduced tail-loop fidelity.
  */
-function controlFlowResolve(predicate: SchemeValue): ((value: unknown) => unknown | undefined) | undefined {
+function controlFlowResolve(predicate: SchemeValue, tap?: EvalTap): ((value: unknown) => unknown | undefined) | undefined {
   if (!(predicate instanceof AValue) || predicate.provenance.size === 0) return undefined;
   return (value: unknown): unknown | undefined => {
-    const stamped = restrictControlFlowProvenance(predicate, value as SchemeValue);
+    const stamped = restrictControlFlowProvenance(predicate, value as SchemeValue, tap);
     return stamped === value ? undefined : stamped;
   };
 }
@@ -846,7 +849,7 @@ function* evalIf(rest: SchemeValue, ctx: EvalContext): EvalGenerator {
     testResult = yield testResult;
   }
 
-  const onResolve = controlFlowResolve(testResult);
+  const onResolve = controlFlowResolve(testResult, ctx.tap);
   const inTail = ctx.tail === true;
   if (is_false(testResult)) {
     if (elseExpr !== undefined) {
@@ -1877,7 +1880,7 @@ function* evalCond(rest: SchemeValue, ctx: EvalContext): EvalGenerator {
           return yield {
             call: applyArrowProc(proc, testResult, ctx),
             tail: ctx.tail === true,
-            onResolve: controlFlowResolve(testResult),
+            onResolve: controlFlowResolve(testResult, ctx.tap),
           };
         }
       }
@@ -1887,7 +1890,11 @@ function* evalCond(rest: SchemeValue, ctx: EvalContext): EvalGenerator {
         return testResult;
       }
 
-      return yield { call: evalBegin(exprs, ctx), tail: ctx.tail === true, onResolve: controlFlowResolve(testResult) };
+      return yield {
+        call: evalBegin(exprs, ctx),
+        tail: ctx.tail === true,
+        onResolve: controlFlowResolve(testResult, ctx.tap),
+      };
     }
 
     node = node.cdr;
@@ -1925,10 +1932,10 @@ function* evalCase(rest: SchemeValue, ctx: EvalContext): EvalGenerator {
         return yield {
           call: applyArrowProc(arrowProc, key, ctx),
           tail: ctx.tail === true,
-          onResolve: controlFlowResolve(key),
+          onResolve: controlFlowResolve(key, ctx.tap),
         };
       }
-      return yield { call: evalBegin(exprs, ctx), tail: ctx.tail === true };
+      return yield { call: evalBegin(exprs, ctx), tail: ctx.tail === true, onResolve: controlFlowResolve(key, ctx.tap) };
     }
 
     // BG9: the datum-list head is data and is NEVER bracket-converted — a vector here
@@ -1958,12 +1965,12 @@ function* evalCase(rest: SchemeValue, ctx: EvalContext): EvalGenerator {
         return yield {
           call: applyArrowProc(arrowProc, key, ctx),
           tail: ctx.tail === true,
-          onResolve: controlFlowResolve(key),
+          onResolve: controlFlowResolve(key, ctx.tap),
         };
       }
       // Per spec §5.3 the case key plays the predicate role — its lineage picked this
       // arm; provenance rides as onResolve (preamble CONTROL-FLOW PROVENANCE).
-      return yield { call: evalBegin(exprs, ctx), tail: ctx.tail === true, onResolve: controlFlowResolve(key) };
+      return yield { call: evalBegin(exprs, ctx), tail: ctx.tail === true, onResolve: controlFlowResolve(key, ctx.tap) };
     }
 
     node = node.cdr;
@@ -2013,7 +2020,11 @@ function* evalWhen(rest: SchemeValue, ctx: EvalContext): EvalGenerator {
   }
 
   if (!is_false(testResult)) {
-    return yield { call: evalBegin(body, ctx), tail: ctx.tail === true, onResolve: controlFlowResolve(testResult) };
+    return yield {
+      call: evalBegin(body, ctx),
+      tail: ctx.tail === true,
+      onResolve: controlFlowResolve(testResult, ctx.tap),
+    };
   }
 
   return theVoid;
@@ -2033,7 +2044,11 @@ function* evalUnless(rest: SchemeValue, ctx: EvalContext): EvalGenerator {
   }
 
   if (is_false(testResult)) {
-    return yield { call: evalBegin(body, ctx), tail: ctx.tail === true, onResolve: controlFlowResolve(testResult) };
+    return yield {
+      call: evalBegin(body, ctx),
+      tail: ctx.tail === true,
+      onResolve: controlFlowResolve(testResult, ctx.tap),
+    };
   }
 
   return theVoid;
@@ -2447,7 +2462,10 @@ function* evalDefineVariant(rest: SchemeValue, ctx: EvalContext): EvalGenerator 
           [new ASymbol(":kind"), new ASymbol(`:${tag}`)],
           ...fields.map((f, i) => [new ASymbol(`:${f}`), values[i]] as const),
         ];
-        return new ADict(pairs, unionProvenance(values));
+        return new ADict(
+          pairs,
+          unionProvenance((values as readonly unknown[]).filter((v): v is AValue => v instanceof AValue)),
+        );
       },
     });
     ctor.__name__ = variantName;
@@ -2611,7 +2629,7 @@ function* evalMatch(rest: SchemeValue, ctx: EvalContext): EvalGenerator {
     target = yield target;
   }
 
-  const onResolve = controlFlowResolve(target);
+  const onResolve = controlFlowResolve(target, ctx.tap);
   const inTail = ctx.tail === true;
 
   for (const clause of parsedClauses) {
@@ -2644,7 +2662,7 @@ function* evalMatch(rest: SchemeValue, ctx: EvalContext): EvalGenerator {
           if (is_promise(fv)) {
             fv = yield fv;
           }
-          matchResolver.env.bind(pv, restrictControlFlowProvenance(target, fv));
+          matchResolver.env.bind(pv, restrictControlFlowProvenance(target, fv, ctx.tap));
         }
         return yield { call: evalBegin(clause.body, { ...ctx, resolver: matchResolver }), tail: inTail, onResolve };
       }

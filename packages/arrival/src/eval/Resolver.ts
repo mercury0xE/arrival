@@ -143,6 +143,7 @@ export type ScopeKind =
   | "named-let"
   | "do"
   | "catch"
+  | "match"
   | "user";
 
 export class Resolver {

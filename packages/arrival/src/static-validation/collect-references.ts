@@ -33,6 +33,8 @@
 
 import { APair } from "../values/primitives/APair.js";
 import { ASymbol } from "../values/primitives/ASymbol.js";
+import { AValue } from "../values/primitives/AValue.js";
+import { AVector } from "../values/primitives/AVector.js";
 import type { SourceLocation } from "../errors.js";
 import type { SchemeValue } from "../values/types.js";
 
@@ -70,8 +72,9 @@ function nameOf(s: ASymbol): string | null {
 /** Keyword-shaped names (`:foo`) are self-typed accessors, not env lookups. */
 const isKeywordName = (name: string): boolean => name.length > 1 && name.startsWith(":");
 
-/** Elements of a (possibly improper) pair chain; the dotted tail appended last. */
+/** Elements of a (possibly improper) pair chain or `[…]` bracket vector; dotted tail appended last. */
 function chainOf(n: unknown): unknown[] {
+  if (n instanceof AVector && n.evalElements) return [...n.__vector__];
   const out: unknown[] = [];
   let cur: unknown = n;
   while (cur instanceof APair) {
@@ -82,6 +85,20 @@ function chainOf(n: unknown): unknown[] {
   return out;
 }
 
+/** Unpack `((v init)…)`, `([v init]…)`, or Clojure flat `[v init …]` into `[sym, rest]` pairs. */
+function bindingPairsOf(raw: unknown): [ASymbol, unknown[]][] {
+  const clauses =
+    raw instanceof AVector && raw.evalElements && raw.__vector__[0] instanceof ASymbol
+      ? Array.from({ length: Math.floor(raw.__vector__.length / 2) }, (_, i) => [
+          raw.__vector__[i * 2],
+          raw.__vector__[i * 2 + 1],
+        ])
+      : chainOf(raw).map((b) => chainOf(b));
+  return clauses
+    .filter((parts): parts is [ASymbol, ...unknown[]] => parts[0] instanceof ASymbol)
+    .map(([sym, ...rest]) => [sym, rest]);
+}
+
 /** Formal-parameter names of a lambda formals datum (proper/improper/bare-rest). */
 function formalNames(formals: unknown): string[] {
   const out: string[] = [];
@@ -90,17 +107,11 @@ function formalNames(formals: unknown): string[] {
     if (n !== null) out.push(n);
     return out;
   }
-  let cur: unknown = formals;
-  while (cur instanceof APair) {
-    if (cur.car instanceof ASymbol) {
-      const n = nameOf(cur.car);
+  for (const el of chainOf(formals)) {
+    if (el instanceof ASymbol) {
+      const n = nameOf(el);
       if (n !== null) out.push(n);
     }
-    cur = cur.cdr;
-  }
-  if (cur instanceof ASymbol) {
-    const n = nameOf(cur);
-    if (n !== null) out.push(n); // dotted rest formal
   }
   return out;
 }
@@ -167,7 +178,7 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
   /** Walk a BODY SEQUENCE with the internal-define letrec* pre-pass: the
    *  sequence's own definition names bind for EVERY form in it, both directions. */
   const walkBody = (body: unknown, bound: ReadonlySet<string>, span: SourceLocation | undefined): void => {
-    const forms = chainOf(body);
+    const forms = Array.isArray(body) ? body : chainOf(body);
     const names: string[] = [];
     for (const f of forms) {
       const def = definitionOf(f);
@@ -185,7 +196,11 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
       if (!bound.has(name) && !initial.has(name)) emit(name, span);
       return;
     }
-    if (!(n instanceof APair)) return;
+    if (!(n instanceof APair)) {
+      const lowered = n instanceof AValue ? n["arrival/tagless-final/lower"]?.() : null;
+      if (lowered instanceof APair) walk(lowered, bound, span);
+      return;
+    }
     if (seen.has(n)) return;
     seen.add(n);
     const loc = n.location ?? span;
@@ -220,23 +235,19 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
               const afterName = n.cdr.cdr;
               if (!(afterName instanceof APair)) return;
               const names: string[] = loopName === null ? [] : [loopName];
-              for (const b of chainOf(afterName.car)) {
-                if (b instanceof APair && b.car instanceof ASymbol) {
-                  const bn = nameOf(b.car);
-                  if (bn !== null) names.push(bn);
-                  if (b.cdr instanceof APair) walk(b.cdr.car, bound, loc);
-                }
+              for (const [sym, rest] of bindingPairsOf(afterName.car)) {
+                const bn = nameOf(sym);
+                if (bn !== null) names.push(bn);
+                if (rest.length > 0) walk(rest[0], bound, loc);
               }
               walkBody(afterName.cdr, new Set([...bound, ...names]), loc);
               return;
             }
             const names: string[] = [];
-            for (const b of chainOf(n.cdr.car)) {
-              if (b instanceof APair && b.car instanceof ASymbol) {
-                const bn = nameOf(b.car);
-                if (bn !== null) names.push(bn);
-                if (b.cdr instanceof APair) walk(b.cdr.car, bound, loc); // parallel: inits see outer
-              }
+            for (const [sym, rest] of bindingPairsOf(n.cdr.car)) {
+              const bn = nameOf(sym);
+              if (bn !== null) names.push(bn);
+              if (rest.length > 0) walk(rest[0], bound, loc); // parallel: inits see outer
             }
             walkBody(n.cdr.cdr, new Set([...bound, ...names]), loc);
             return;
@@ -244,12 +255,10 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
           case "let*": {
             if (!(n.cdr instanceof APair)) return;
             let cur: ReadonlySet<string> = bound;
-            for (const b of chainOf(n.cdr.car)) {
-              if (b instanceof APair && b.car instanceof ASymbol) {
-                if (b.cdr instanceof APair) walk(b.cdr.car, cur, loc); // sequential: init sees priors
-                const bn = nameOf(b.car);
-                if (bn !== null) cur = new Set([...cur, bn]);
-              }
+            for (const [sym, rest] of bindingPairsOf(n.cdr.car)) {
+              if (rest.length > 0) walk(rest[0], cur, loc); // sequential: init sees priors
+              const bn = nameOf(sym);
+              if (bn !== null) cur = new Set([...cur, bn]);
             }
             walkBody(n.cdr.cdr, cur, loc);
             return;
@@ -259,12 +268,10 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
             if (!(n.cdr instanceof APair)) return;
             const names: string[] = [];
             const inits: unknown[] = [];
-            for (const b of chainOf(n.cdr.car)) {
-              if (b instanceof APair && b.car instanceof ASymbol) {
-                const bn = nameOf(b.car);
-                if (bn !== null) names.push(bn);
-                if (b.cdr instanceof APair) inits.push(b.cdr.car);
-              }
+            for (const [sym, rest] of bindingPairsOf(n.cdr.car)) {
+              const bn = nameOf(sym);
+              if (bn !== null) names.push(bn);
+              if (rest.length > 0) inits.push(rest[0]);
             }
             const all = new Set([...bound, ...names]); // recursive: all names bind everywhere
             for (const init of inits) walk(init, all, loc);
@@ -277,14 +284,11 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
             if (!(n.cdr instanceof APair)) return;
             const names: string[] = [];
             const laters: unknown[] = [];
-            for (const b of chainOf(n.cdr.car)) {
-              if (b instanceof APair && b.car instanceof ASymbol) {
-                const bn = nameOf(b.car);
-                if (bn !== null) names.push(bn);
-                const rest = chainOf(b.cdr);
-                if (rest.length > 0) walk(rest[0], bound, loc); // init: outer scope
-                for (const step of rest.slice(1)) laters.push(step);
-              }
+            for (const [sym, rest] of bindingPairsOf(n.cdr.car)) {
+              const bn = nameOf(sym);
+              if (bn !== null) names.push(bn);
+              if (rest.length > 0) walk(rest[0], bound, loc); // init: outer scope
+              for (const step of rest.slice(1)) laters.push(step);
             }
             const inner = new Set([...bound, ...names]);
             for (const step of laters) walk(step, inner, loc);
@@ -328,8 +332,10 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
             if (!(n.cdr instanceof APair)) return;
             walk(n.cdr.car, bound, loc);
             for (const clause of chainOf(n.cdr.cdr)) {
-              if (!(clause instanceof APair)) continue;
-              const pat = clause.car;
+              const clauseParts = chainOf(clause);
+              if (clauseParts.length === 0) continue;
+              const pat = clauseParts[0];
+              const body = clauseParts.slice(1);
               if (pat instanceof APair) {
                 const patParts = chainOf(pat);
                 const patVars: string[] = [];
@@ -339,13 +345,13 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
                     if (pn !== null && pn !== "_") patVars.push(pn);
                   }
                 }
-                walkBody(clause.cdr, new Set([...bound, ...patVars]), loc);
+                walkBody(body, new Set([...bound, ...patVars]), loc);
               } else if (pat instanceof ASymbol) {
                 const pn = nameOf(pat);
                 const inner = pn !== null && pn !== "else" && pn !== "_" ? new Set([...bound, pn]) : bound;
-                walkBody(clause.cdr, inner, loc);
+                walkBody(body, inner, loc);
               } else {
-                walkBody(clause.cdr, bound, loc);
+                walkBody(body, bound, loc);
               }
             }
             return;
@@ -376,10 +382,11 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
           }
           case "cond": {
             for (const clause of chainOf(n.cdr)) {
-              if (!(clause instanceof APair)) continue;
-              const test = clause.car;
+              const parts = chainOf(clause);
+              if (parts.length === 0) continue;
+              const test = parts[0];
               if (!(test instanceof ASymbol && nameOf(test) === "else")) walk(test, bound, loc);
-              for (const bodyForm of chainOf(clause.cdr)) {
+              for (const bodyForm of parts.slice(1)) {
                 if (bodyForm instanceof ASymbol && nameOf(bodyForm) === "=>") continue;
                 walk(bodyForm, bound, loc);
               }
@@ -390,9 +397,10 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
             const parts = chainOf(n.cdr);
             if (parts.length > 0) walk(parts[0], bound, loc);
             for (const clause of parts.slice(1)) {
-              if (!(clause instanceof APair)) continue;
-              // clause.car is a datum list (or `else`) — data, skipped.
-              walkBody(clause.cdr, bound, loc);
+              const clauseParts = chainOf(clause);
+              if (clauseParts.length === 0) continue;
+              // clauseParts[0] is a datum list (or `else`) — data, skipped.
+              walkBody(clauseParts.slice(1), bound, loc);
             }
             return;
           }
@@ -402,8 +410,7 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
           case "unless":
           case "and":
           case "or":
-          case "while":
-          case "set!": {
+          case "while": {
             // Non-binding special forms: the head is evaluator syntax, never a
             // variable — walk operands only. `begin` bodies get the internal-define
             // pre-pass (R7RS splicing).
@@ -444,7 +451,12 @@ export function collectReferences(form: SchemeValue, opts: CollectReferencesOpti
   /** Quasiquote space: symbols are data except under `unquote`/`unquote-splicing`
    *  at depth 1; nested quasiquote increments depth (R7RS nesting). */
   const walkQuasi = (n: unknown, depth: number, bound: ReadonlySet<string>, span: SourceLocation | undefined): void => {
-    if (!(n instanceof APair)) return;
+    if (!(n instanceof APair)) {
+      const lowered = n instanceof AValue ? n["arrival/tagless-final/lower"]?.() : null;
+      if (lowered instanceof APair) walkQuasi(lowered, depth, bound, span);
+      else if (n instanceof AVector) for (const el of n.__vector__) walkQuasi(el, depth, bound, span);
+      return;
+    }
     if (seen.has(n)) return;
     seen.add(n);
     const loc = n.location ?? span;

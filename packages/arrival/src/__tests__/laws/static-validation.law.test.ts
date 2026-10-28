@@ -436,3 +436,34 @@ describe("LAW 8 — Stage 3: `requiresConfig` auto-mints a cause-carrying door, 
     expect(hits).toBe(1);
   });
 });
+
+describe("purity door heads (`set!`) — caught by static validation even when target is bound", () => {
+  it("reports `bound-to-door` on `(define x 1) (set! x 2)`, `(let ((x 1)) (set! x 2))`, and inside `[...]`/`{...}` literals", async () => {
+    for (const src of [
+      "(define x 1) (set! x 2)",
+      "(let ((x 1)) (set! x 2))",
+      "(define x 1) [(set! x 2)]",
+      "(define x 1) {:a (set! x 2)}",
+    ]) {
+      let caught: unknown;
+      try {
+        await exec(src, { staticValidation: "on" });
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(StaticValidationError);
+      const err = caught as StaticValidationError;
+      expect(err.diagnostics).toHaveLength(1);
+      expect(err.diagnostics[0].code).toBe("bound-to-door");
+      expect(err.diagnostics[0].sites.map((s) => s.symbol)).toEqual(["set!"]);
+    }
+  });
+
+  it("allows lexically shadowed `set!` and bracketed `let` bindings without false-positive", async () => {
+    const [res] = await exec("(let ((set! (lambda (a b) b)) (x 1)) (set! x 42))", { staticValidation: "on" });
+    expect(res).toBe(42);
+    const [bracketed] = await exec("(let ([x 10]) (+ x (let [y 20 z 12] (+ y z))))", { staticValidation: "on" });
+    expect(bracketed).toBe(42);
+  });
+});
+

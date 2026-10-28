@@ -291,6 +291,50 @@ function runRootedScope(runCtx: RunContext): LexicalScope {
   return defines === undefined ? LexicalScope.fresh() : LexicalScope.for(defines.child("session"));
 }
 
+export type AssembleExecRunContextOptions = Pick<
+  ExecOptions,
+  | "capabilities"
+  | "config"
+  | "runCtx"
+  | "strict"
+  | "signal"
+  | "cache"
+  | "effects"
+  | "reads"
+  | "strictCQSstrings"
+  | "resourcePaths"
+  | "notes"
+  | "display"
+  | "membraneClosure"
+>;
+
+/**
+ * Mint (or reuse) a vocabulary-armed {@link RunContext} with the same `BASE_ROSTER` fold
+ * and per-run prelude evaluation that {@link execState} performs, without parsing or
+ * evaluating a dummy expression. Caller owns the returned `RunContext` and must dispose
+ * it via {@link disposeRunContext}.
+ */
+export async function assembleExecRunContext(options: AssembleExecRunContextOptions = {}): Promise<RunContext> {
+  const effectiveCapabilities = [...(options.capabilities ?? []), ...BASE_ROSTER];
+  return assembleRun({
+    capabilities: effectiveCapabilities,
+    config: options.config,
+    evalScheme: capabilityEvalScheme,
+    evalPrelude: preludeEvalScheme,
+    runCtx: options.runCtx,
+    strict: options.strict,
+    signal: options.signal,
+    cache: options.cache,
+    effects: options.effects,
+    reads: options.reads,
+    strictCQSstrings: options.strictCQSstrings,
+    resourcePaths: options.resourcePaths,
+    notes: options.notes,
+    display: options.display,
+    membraneClosure: options.membraneClosure,
+  });
+}
+
 /**
  * Parse and execute Scheme code — COMPLEX tier (see {@link ExecState}). EVERY
  * run resolves through the self-hosted, memoized Vocabulary:
@@ -390,7 +434,7 @@ export async function execState(code: string | SchemeValue, options: ExecOptions
   // Fresh scope per call unless the caller opts into continuity. Fresh root is
   // prelude-define-framed; seeds stay out of the walk.
   const lexicalScope = scope ?? runRootedScope(runCtx);
-  const runResolver = new Resolver(lexicalScope.env, new Capabilities(chainFrame, chain));
+  const runResolver = new Resolver(lexicalScope.env, new Capabilities(chainFrame, chain, preludeDefinesOf(runCtx)));
 
   try {
     const results: SchemeValue[] = [];

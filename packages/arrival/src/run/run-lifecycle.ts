@@ -26,6 +26,9 @@ type Teardown = () => Promise<void>;
 interface RunLifecycle {
   teardowns: Teardown[];
   disposed: boolean;
+  disposeRequested: boolean;
+  inFlight: number;
+  backstopArmed: boolean;
 }
 
 const lifecycles = new WeakMap<RunContext, RunLifecycle>();
@@ -45,20 +48,66 @@ const backstop = new FinalizationRegistry<RunLifecycle>((lifecycle) => {
 function lifecycleOf(runCtx: RunContext): RunLifecycle {
   let lifecycle = lifecycles.get(runCtx);
   if (lifecycle === undefined) {
-    lifecycle = { teardowns: [], disposed: false };
+    lifecycle = {
+      teardowns: [],
+      disposed: false,
+      disposeRequested: false,
+      inFlight: 0,
+      backstopArmed: false,
+    };
     lifecycles.set(runCtx, lifecycle);
-    backstop.register(runCtx, lifecycle, runCtx);
   }
   return lifecycle;
 }
 
+async function runTeardowns(runCtx: RunContext, lifecycle: RunLifecycle): Promise<void> {
+  if (lifecycle.disposed) return;
+  lifecycle.disposed = true;
+  if (lifecycle.backstopArmed) {
+    lifecycle.backstopArmed = false;
+    backstop.unregister(runCtx);
+  }
+  const pending = lifecycle.teardowns;
+  lifecycle.teardowns = [];
+  if (pending.length > 0) {
+    await Promise.allSettled(pending.map((fn) => fn()));
+  }
+}
+
 /** Register `teardown` to run once at `runCtx` disposal (explicit or backstop). Called on
  *  a resource's FIRST touch under a given RunContext. Already-disposed run accepts no
- *  further teardowns (silent) — nothing should still spawn resources against a ended session. */
+ *  further teardowns (silent) — nothing should still spawn resources against a ended session.
+ *  When `disposeRequested && !disposed` (an in-flight host call is draining), the teardown
+ *  is still registered so it runs as soon as `inFlight` reaches 0. */
 export function onRunContextDispose(runCtx: RunContext, teardown: Teardown): void {
   const lifecycle = lifecycleOf(runCtx);
   if (lifecycle.disposed) return;
+  if (!lifecycle.backstopArmed) {
+    lifecycle.backstopArmed = true;
+    backstop.register(runCtx, lifecycle, runCtx);
+  }
   lifecycle.teardowns.push(teardown);
+}
+
+/** Increment the in-flight host operation count for `runCtx` so a concurrent
+ *  {@link disposeRunContext} defers physical teardown until {@link releaseRunContext}. */
+export function retainRunContext(runCtx: RunContext): void {
+  const lifecycle = lifecycleOf(runCtx);
+  if (lifecycle.disposed) return;
+  lifecycle.inFlight += 1;
+}
+
+/** Decrement the in-flight host operation count for `runCtx`. If disposal was requested
+ *  while this operation was in flight and `inFlight` reaches 0, execute teardowns now. */
+export async function releaseRunContext(runCtx: RunContext): Promise<void> {
+  const lifecycle = lifecycles.get(runCtx);
+  if (lifecycle === undefined) return;
+  if (lifecycle.inFlight > 0) {
+    lifecycle.inFlight -= 1;
+  }
+  if (lifecycle.inFlight === 0 && lifecycle.disposeRequested && !lifecycle.disposed) {
+    await runTeardowns(runCtx, lifecycle);
+  }
 }
 
 /** Tear `runCtx` down: run every accumulated teardown (parallel, best-effort —
@@ -66,11 +115,9 @@ export function onRunContextDispose(runCtx: RunContext, teardown: Teardown): voi
  *  ONE function every teardown path funnels through: exec's owned-runCtx finally,
  *  REPL session close, and `[Symbol.asyncDispose]`. */
 export async function disposeRunContext(runCtx: RunContext): Promise<void> {
-  const lifecycle = lifecycles.get(runCtx);
-  if (lifecycle === undefined || lifecycle.disposed) return;
-  lifecycle.disposed = true;
-  backstop.unregister(runCtx);
-  const pending = lifecycle.teardowns;
-  lifecycle.teardowns = [];
-  await Promise.allSettled(pending.map((fn) => fn()));
+  const lifecycle = lifecycleOf(runCtx);
+  if (lifecycle.disposed) return;
+  lifecycle.disposeRequested = true;
+  if (lifecycle.inFlight > 0) return;
+  await runTeardowns(runCtx, lifecycle);
 }

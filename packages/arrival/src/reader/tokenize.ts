@@ -74,38 +74,53 @@ export function tokenize(str: string | AString, meta = false): TokenMeta[] | str
   }
 }
 
-function strip_s_comments(tokens: string[]): string[] {
-  let s_count = 0;
-  let s_start: number | null = null;
-  const remove_list: [number, number][] = [];
-  for (let i = 0; i < tokens.length; ++i) {
-    const token = tokens[i];
-    if (token === "#;") {
-      if (["(", "["].includes(tokens[i + 1])) {
-        s_count = 1;
-        s_start = i;
-      } else {
-        remove_list.push([i, i + 2]);
+const DATUM_OPEN = new Set(["(", "[", "{", "#(", "#u8("]);
+const DATUM_CLOSE = new Set([")", "]", "}"]);
+const DATUM_QUOTE = new Set(["'", "`", ",", ",@", "#attachment"]);
+
+function isDatumPrefix(tok: string): boolean {
+  return DATUM_QUOTE.has(tok) || /^#\d+=$/.test(tok);
+}
+
+function skipDatumTokens(tokens: readonly string[], start: number): number {
+  let i = start;
+  while (i < tokens.length && tokens[i] === "#;") {
+    i = skipDatumTokens(tokens, i + 1);
+  }
+  while (i < tokens.length && isDatumPrefix(tokens[i]!)) {
+    i++;
+    while (i < tokens.length && tokens[i] === "#;") {
+      i = skipDatumTokens(tokens, i + 1);
+    }
+  }
+  if (i >= tokens.length || DATUM_CLOSE.has(tokens[i]!)) return i;
+  if (DATUM_OPEN.has(tokens[i]!)) {
+    let depth = 0;
+    while (i < tokens.length) {
+      const tok = tokens[i]!;
+      if (DATUM_OPEN.has(tok)) depth++;
+      else if (DATUM_CLOSE.has(tok)) {
+        depth--;
+        if (depth <= 0) return i + 1;
       }
-      i += 1;
+      i++;
+    }
+    return i;
+  }
+  return i + 1;
+}
+
+function strip_s_comments(tokens: string[]): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < tokens.length) {
+    if (tokens[i] === "#;") {
+      i = skipDatumTokens(tokens, i + 1);
       continue;
     }
-    if (s_start !== null) {
-      if ([")", "]"].includes(token)) {
-        s_count--;
-      } else if (["(", "["].includes(token)) {
-        s_count++;
-      }
-      if (s_count === 0) {
-        remove_list.push([s_start, i + 1]);
-        s_start = null;
-      }
-    }
+    out.push(tokens[i]!);
+    i++;
   }
-  tokens = [...tokens];
-  remove_list.reverse();
-  for (const [begin, end] of remove_list) {
-    tokens.splice(begin, end - begin);
-  }
-  return tokens;
+  return out;
 }
+

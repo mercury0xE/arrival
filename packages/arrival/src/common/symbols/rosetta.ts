@@ -32,6 +32,7 @@ import type { SchemeValue } from "../../values/types.js";
 import invariant from "tiny-invariant";
 import { type CallCtx } from "../../run/CallCtx.js";
 import { applyMembraneClosure } from "../../run/RunContext.js";
+import { releaseRunContext, retainRunContext } from "../../run/run-lifecycle.js";
 import {
   assertContractAxes,
   type BakeRuntimeOpts,
@@ -402,12 +403,18 @@ _installRosettaMembraneApply(async (proc, args, callCtx) => {
     const runCache = callCtx.runCtx.cache;
     const burstLog = callCtx.runCtx.effects;
     const runReads = callCtx.runCtx.reads;
-    const fire = async (): Promise<unknown> =>
-      applyMembraneClosure(callCtx.runCtx, () =>
-        scope
-          ? withRegionScope(scope, () => m.hostImpl.call(callCtx, ...decodedArgs))
-          : m.hostImpl.call(callCtx, ...decodedArgs),
-      );
+    const fire = async (): Promise<unknown> => {
+      retainRunContext(callCtx.runCtx);
+      try {
+        return await applyMembraneClosure(callCtx.runCtx, () =>
+          scope
+            ? withRegionScope(scope, () => m.hostImpl.call(callCtx, ...decodedArgs))
+            : m.hostImpl.call(callCtx, ...decodedArgs),
+        );
+      } finally {
+        await releaseRunContext(callCtx.runCtx);
+      }
+    };
     // Fast-path: no cache, no effect-log, and no path-derived storage work → bare fire.
     // Path Q/E with armed cache/effects must enter penetrateThroughCache (I6–I8).
     const needsPathStorage =

@@ -40,6 +40,7 @@ import type { EffectLog } from "../run/effect-log.js";
 import type { ReadGuard } from "../run/read-guard.js";
 import type { ResourcePathLog } from "../run/resource-paths.js";
 import { RunContext, type MembraneClosure } from "../run/RunContext.js";
+import { disposeRunContext } from "../run/run-lifecycle.js";
 import { buildVocabulary, type Vocabulary } from "./vocabulary.js";
 import { type EnvWithInternals, ResolvingAmbient } from "./AmbientRuntime.js";
 import invariant from "tiny-invariant";
@@ -139,31 +140,36 @@ export async function assembleRun(opts: AssembleRunOptions): Promise<RunContext>
 
   // Per-run prelude (module header). preludes already C3-ordered + identity-deduped.
   if (vocabulary.preludes.length > 0) {
-    invariant(
-      opts.evalPrelude !== undefined,
-      "assembleRun: this tuple's capabilities declare a prelude — AssembleRunOptions.evalPrelude is required",
-    );
-    // TWO frames (ruling 2026-08-13, audit B4):
-    //   SEED — null-rooted, main map bound FIRST then the preludeOnly overlay (on a
-    //   cross-capability name collision preludeOnly therefore SHADOWS the main symbol
-    //   DURING the prelude pass — the defined rule, pinned by P-PRELUDE-PHASE-SHADOW).
-    //   The seed is discarded with the pass; preludeOnly names never reach main-phase
-    //   resolution. Closures keep their captures into it — invocation survives.
-    //   EVAL — a child the prelude TEXT evaluates against, so its `(define …)`s land
-    //   separately from the seed; after the pass they are copied into the run's
-    //   persistent define frame and become main-phase bindings.
-    const preludeSeed = ResolvingAmbient.root("assemble-run-prelude-seed") as EnvWithInternals<ResolvingAmbient>;
-    for (const [name, value] of vocabulary.map) preludeSeed.bind(name, value);
-    for (const [name, value] of vocabulary.preludeOnly) preludeSeed.bind(name, value);
-    const preludeScope = preludeSeed.child("assemble-run-prelude");
-    for (const { text } of vocabulary.preludes) {
-      await opts.evalPrelude(preludeScope, text, runCtx);
-    }
-    // Persist the pass's defines. Own-record read, sanctioned here: `list()` is the
-    // frame's OWN names and the values were bound through `.bind` (already boxed) —
-    // same boundary narrow vocabulary.ts documents for its own raw reads.
-    for (const name of preludeScope.list()) {
-      defines.bind(name, preludeScope.__env__[name]!);
+    try {
+      invariant(
+        opts.evalPrelude !== undefined,
+        "assembleRun: this tuple's capabilities declare a prelude — AssembleRunOptions.evalPrelude is required",
+      );
+      // TWO frames (ruling 2026-08-13, audit B4):
+      //   SEED — null-rooted, main map bound FIRST then the preludeOnly overlay (on a
+      //   cross-capability name collision preludeOnly therefore SHADOWS the main symbol
+      //   DURING the prelude pass — the defined rule, pinned by P-PRELUDE-PHASE-SHADOW).
+      //   The seed is discarded with the pass; preludeOnly names never reach main-phase
+      //   resolution. Closures keep their captures into it — invocation survives.
+      //   EVAL — a child the prelude TEXT evaluates against, so its `(define …)`s land
+      //   separately from the seed; after the pass they are copied into the run's
+      //   persistent define frame and become main-phase bindings.
+      const preludeSeed = ResolvingAmbient.root("assemble-run-prelude-seed") as EnvWithInternals<ResolvingAmbient>;
+      for (const [name, value] of vocabulary.map) preludeSeed.bind(name, value);
+      for (const [name, value] of vocabulary.preludeOnly) preludeSeed.bind(name, value);
+      const preludeScope = preludeSeed.child("assemble-run-prelude");
+      for (const { text } of vocabulary.preludes) {
+        await opts.evalPrelude(preludeScope, text, runCtx);
+      }
+      // Persist the pass's defines. Own-record read, sanctioned here: `list()` is the
+      // frame's OWN names and the values were bound through `.bind` (already boxed) —
+      // same boundary narrow vocabulary.ts documents for its own raw reads.
+      for (const name of preludeScope.list()) {
+        defines.bind(name, preludeScope.__env__[name]!);
+      }
+    } catch (error) {
+      await disposeRunContext(runCtx);
+      throw error;
     }
   }
 

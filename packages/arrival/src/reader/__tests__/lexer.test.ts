@@ -111,4 +111,15 @@ describe("Lexer — edge cases", () => {
     lexer.skip();
     expect(lexer.peek()).toBe(eof);
   });
+
+  it("tokenize(str, false) strips #; datum comments across braces, vectors, quotes, and stacked #;#;", async () => {
+    const { tokenize } = await import("../tokenize.js");
+    const toks = (s: string) => tokenize(s, false);
+    expect(toks("#;{ :a 1 } 42")).toEqual(["42"]);
+    expect(toks("#;#(1 2 3) 42")).toEqual(["42"]);
+    expect(toks("#;#u8(1 2) 42")).toEqual(["42"]);
+    expect(toks("#;'(a b) 42")).toEqual(["42"]);
+    expect(toks("#;#;(a b) (c d) 42")).toEqual(["42"]);
+    expect(toks("#;'#;{ :a (b) } (c d) 42")).toEqual(["42"]);
+  });
 });

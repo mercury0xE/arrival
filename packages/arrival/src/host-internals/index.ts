@@ -99,7 +99,12 @@ export { type LexicalScopeWithInternals } from "../eval/LexicalScope.js";
 export { ensurePreludeDefineFrame } from "../env/assemble-run.js";
 export { getCapabilityResources } from "../run/CallCtx.js";
 // Bake/prelude eval into a concrete frame — mid-run packs and their tests.
-export { execInFrame } from "../eval/generator-exec.js";
+export {
+  execInFrame,
+  assembleExecRunContext,
+  type AssembleExecRunContextOptions,
+} from "../eval/generator-exec.js";
+export { retainRunContext, releaseRunContext } from "../run/run-lifecycle.js";
 
 // Mid-run assembly kernel: `createRuntimeAssembler` applies host-registered `EnvPack`s
 // onto an already-live env (backing a host-armed `configuration.extensionRegistry` —

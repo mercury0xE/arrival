@@ -60,4 +60,64 @@ describe("EvalTrace.toolNameFor — deepProvenance ordinals resolve to verb name
     expect(trace.toolNameFor(999)).toBeUndefined();
     expect(trace.invocationById(999)).toBeUndefined();
   });
+
+  it("enclosing (let* ...) over (if pred then else) forwards branch provenance without unioning unchosen binding", async () => {
+    const branchCap = EnvCapability.define("test/branch-prov", {
+      symbols: (symbol, z) => ({
+        "read-flag": symbol.rosetta`read-flag: boolean predicate source`(
+          { input: [], output: [z.boolean], provenance: "source" },
+          async () => true,
+        ),
+        "read-chosen": symbol.rosetta`read-chosen: chosen branch source`(
+          { input: [], output: [z.string], provenance: "source" },
+          async () => "chosen",
+        ),
+        "read-unchosen": symbol.rosetta`read-unchosen: unchosen branch source`(
+          { input: [], output: [z.string], provenance: "source" },
+          async () => "unchosen",
+        ),
+      }),
+    });
+    const trace = new EvalTrace();
+    const {
+      values: [out],
+    } = await execState(
+      `(let* ((flag (read-flag))
+              (a (read-chosen))
+              (b (read-unchosen)))
+         (if flag a b))`,
+      { capabilities: [branchCap], tap: trace },
+    );
+    expect(toJS(out)).toBe("chosen");
+    const names = [...deepProvenance(out)].map((id) => trace.toolNameFor(id)).toSorted();
+    expect(names).toEqual(["read-chosen", "read-flag"]);
+
+    const whenTrace = new EvalTrace();
+    const {
+      values: [whenOut],
+    } = await execState(`(when (read-flag) (read-unchosen) (read-chosen))`, {
+      capabilities: [branchCap],
+      tap: whenTrace,
+    });
+    expect(toJS(whenOut)).toBe("chosen");
+    expect([...deepProvenance(whenOut)].map((id) => whenTrace.toolNameFor(id)).toSorted()).toEqual([
+      "read-chosen",
+      "read-flag",
+    ]);
+
+    const condTrace = new EvalTrace();
+    const {
+      values: [condOut],
+    } = await execState(`(cond ((read-flag) (read-unchosen) (read-chosen)))`, {
+      capabilities: [branchCap],
+      tap: condTrace,
+    });
+    expect(toJS(condOut)).toBe("chosen");
+    expect([...deepProvenance(condOut)].map((id) => condTrace.toolNameFor(id)).toSorted()).toEqual([
+      "read-chosen",
+      "read-flag",
+    ]);
+  });
 });
+
+
